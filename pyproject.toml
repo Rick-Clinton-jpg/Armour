@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "armour-ai"
+version = "0.1.0"
+description = "A deterministic safety boundary for agent-proposed actions"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "PolyForm-Noncommercial-1.0.0"}
+authors = [{name = "Rick Clinton"}]
+dependencies = []
+
+[tool.setuptools.packages.find]
+include = ["armour*"]
