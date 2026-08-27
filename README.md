@@ -2,6 +2,11 @@
 
 Armour is a deterministic safety boundary for AI agents.
 
+> [!WARNING]
+> **Armour is an experimental work in progress.** It has not received a
+> production security audit and must not be treated as a complete security
+> boundary. Evaluate it independently and use it entirely at your own risk.
+
 An agent may plan freely and propose actions. Armour—not the agent—decides whether each action is authorized, rejected, or requires explicit human approval. Armour contains no LLM, autonomy loop, personality, memory system, shell executor, or self-modification mechanism.
 
 ## Install
@@ -141,7 +146,7 @@ Mutation evaluation never executes a proposal. A mutant is “killed” when the
 
 ## Status
 
-Early-stage research prototype. Policy integrity checks, authenticated approval binding, staged receipt chains, and the offline mutation harness are implemented and covered by 39 tests. Armour is suitable for experimentation and integration work, but it is not yet a production security boundary.
+Early-stage research prototype and active work in progress. Policy integrity checks, authenticated approval binding, staged receipt chains, and the offline mutation harness are implemented and covered by 39 tests. These tests are evidence about the cases exercised, not a security certification. Armour is not recommended for production or security-critical use at this stage; evaluation and use are entirely at the user's own risk.
 
 ## Files
 
