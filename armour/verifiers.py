@@ -5,6 +5,7 @@ from __future__ import annotations
 import ipaddress
 import re
 import socket
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Callable, Iterable
 from urllib.parse import urlparse
@@ -31,6 +32,52 @@ class ActionVerifier:
             else f"unknown or disallowed action: {proposal.action!r}"
         )
         return CheckResult(self.name, passed, (reason,))
+
+
+class SchemaVerifier:
+    name = "action_schema"
+
+    @staticmethod
+    def _contains_nested(value: object) -> bool:
+        if isinstance(value, Mapping):
+            return True
+        if isinstance(value, (list, tuple)):
+            return any(
+                isinstance(item, (Mapping, list, tuple))
+                for item in value
+            )
+        return False
+
+    def check(self, proposal: ActionProposal, policy: Policy) -> CheckResult:
+        schema = policy.action_schemas.get(proposal.action)
+        if schema is None:
+            return CheckResult(self.name, True, ("no strict action schema configured",))
+        supplied = frozenset(proposal.payload)
+        unknown = supplied - schema.allowed_payload_keys
+        if unknown:
+            return CheckResult(
+                self.name,
+                False,
+                (f"unknown payload keys: {', '.join(sorted(map(str, unknown)))}",),
+                Risk.HIGH,
+            )
+        missing = schema.required_payload_keys - supplied
+        if missing:
+            return CheckResult(
+                self.name,
+                False,
+                (f"missing required payload keys: {', '.join(sorted(missing))}",),
+            )
+        if not schema.allow_nested_payload and any(
+            self._contains_nested(value) for value in proposal.payload.values()
+        ):
+            return CheckResult(
+                self.name,
+                False,
+                ("nested payload values are forbidden by the action schema",),
+                Risk.HIGH,
+            )
+        return CheckResult(self.name, True, ("strict action schema satisfied",))
 
 
 class EffectVerifier:
@@ -73,20 +120,59 @@ class FilesystemVerifier:
     name = "filesystem_scope"
     PATH_KEYS = frozenset({"path", "target", "source", "destination"})
 
-    def _paths(self, proposal: ActionProposal) -> list[str]:
+    def _paths(
+        self, proposal: ActionProposal, policy: Policy
+    ) -> tuple[list[str], list[str]]:
         values: list[str] = []
+        invalid: list[str] = []
         if proposal.resource and not proposal.resource.startswith(("http://", "https://")):
             values.append(proposal.resource)
-        for key in self.PATH_KEYS:
-            value = proposal.payload.get(key)
-            if isinstance(value, str):
-                values.append(value)
+
+        def visit(value: object) -> None:
+            if isinstance(value, Mapping):
+                for key, item in value.items():
+                    if key in self.PATH_KEYS:
+                        if isinstance(item, str):
+                            values.append(item)
+                        elif isinstance(item, (list, tuple)) and all(
+                            isinstance(entry, str) for entry in item
+                        ):
+                            values.extend(item)
+                        else:
+                            invalid.append(str(key))
+                    visit(item)
             elif isinstance(value, (list, tuple)):
-                values.extend(item for item in value if isinstance(item, str))
-        return values
+                for item in value:
+                    visit(item)
+
+        schema = policy.action_schemas.get(proposal.action)
+        if schema is None:
+            visit(proposal.payload)
+        else:
+            for key in schema.filesystem_path_fields:
+                if key not in proposal.payload:
+                    continue
+                item = proposal.payload.get(key)
+                if isinstance(item, str):
+                    values.append(item)
+                elif isinstance(item, (list, tuple)) and all(
+                    isinstance(entry, str) for entry in item
+                ):
+                    values.extend(item)
+                else:
+                    invalid.append(key)
+        return values, invalid
 
     def check(self, proposal: ActionProposal, policy: Policy) -> CheckResult:
-        paths = self._paths(proposal)
+        paths, invalid = self._paths(proposal, policy)
+        if invalid:
+            fields = ", ".join(sorted(set(invalid)))
+            return CheckResult(
+                self.name,
+                False,
+                (f"filesystem path fields must contain strings: {fields}",),
+                Risk.HIGH,
+            )
         if not paths:
             return CheckResult(self.name, True, ("no filesystem resource",))
         if not policy.allowed_roots:
@@ -99,7 +185,12 @@ class FilesystemVerifier:
                 return CheckResult(
                     self.name, False, (f"relative path rejected at trust boundary: {raw!r}",)
                 )
-            resolved = candidate.resolve(strict=False)
+            try:
+                resolved = candidate.resolve(strict=False)
+            except (OSError, RuntimeError, ValueError):
+                return CheckResult(
+                    self.name, False, (f"invalid filesystem path: {raw!r}",), Risk.HIGH
+                )
             if not any(resolved == root or root in resolved.parents for root in policy.allowed_roots):
                 return CheckResult(
                     self.name, False, (f"path outside allowed roots: {raw!r}",)
@@ -127,7 +218,12 @@ class NetworkVerifier:
             return CheckResult(self.name, False, ("invalid or oversized URL",))
 
         parsed = urlparse(url)
-        method = (proposal.method or proposal.payload.get("method") or "GET").upper()
+        raw_method = proposal.method or proposal.payload.get("method") or "GET"
+        if not isinstance(raw_method, str):
+            return CheckResult(
+                self.name, False, ("HTTP method must be a string",), Risk.HIGH
+            )
+        method = raw_method.upper()
         if method not in policy.allowed_http_methods:
             return CheckResult(self.name, False, (f"HTTP method {method!r} is forbidden",), Risk.HIGH)
         if parsed.scheme not in {"http", "https"} or not parsed.hostname:
@@ -170,6 +266,7 @@ def _looks_like_ip(host: str) -> bool:
 
 class DangerousContentVerifier:
     name = "dangerous_content"
+    SENTENCE_BREAK = re.compile(r"[.!?]\s+")
     PATTERNS = (
         re.compile(r"\brm\s+-rf?\b", re.I),
         re.compile(r"\bDROP\s+(?:TABLE|DATABASE|SCHEMA)\b", re.I),
@@ -179,12 +276,14 @@ class DangerousContentVerifier:
 
     def check(self, proposal: ActionProposal, policy: Policy) -> CheckResult:
         text = repr(dict(proposal.payload))
-        for pattern in self.PATTERNS:
-            if pattern.search(text):
-                return CheckResult(
-                    self.name,
-                    False,
-                    (f"dangerous content matched {pattern.pattern!r}",),
-                    Risk.CRITICAL,
-                )
+        variants = (text, self.SENTENCE_BREAK.sub("", text))
+        for candidate in dict.fromkeys(variants):
+            for pattern in self.PATTERNS:
+                if pattern.search(candidate):
+                    return CheckResult(
+                        self.name,
+                        False,
+                        (f"dangerous content matched {pattern.pattern!r}",),
+                        Risk.CRITICAL,
+                    )
         return CheckResult(self.name, True, ("no dangerous content signature",))

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from enum import IntEnum, StrEnum
 from types import MappingProxyType
@@ -11,6 +11,7 @@ from typing import Any, Mapping
 from uuid import uuid4
 
 import hashlib
+import hmac
 import json
 
 
@@ -130,6 +131,28 @@ class HumanApproval:
     timestamp: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
+    key_id: str = ""
+    signature: str = ""
+
+    def canonical_payload(self) -> bytes:
+        """Return the complete approval envelope in a signable canonical form."""
+        canonical = json.dumps(
+            {
+                "proposal_id": self.proposal_id,
+                "proposal_fingerprint": self.proposal_fingerprint,
+                "policy_fingerprint": self.policy_fingerprint,
+                "approved_by": self.approved_by,
+                "expires_at": self.expires_at,
+                "nonce": self.nonce,
+                "reason": self.reason,
+                "timestamp": self.timestamp,
+                "key_id": self.key_id,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        return canonical.encode()
 
     @classmethod
     def issue(
@@ -140,18 +163,29 @@ class HumanApproval:
         approved_by: str,
         reason: str = "",
         ttl_seconds: int = 300,
+        signing_key: bytes | None = None,
+        key_id: str = "",
     ) -> "HumanApproval":
         if ttl_seconds <= 0:
             raise ValueError("approval TTL must be positive")
+        if signing_key is not None and (not signing_key or not key_id):
+            raise ValueError("signed approvals require a non-empty key and key_id")
         expires = datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)
-        return cls(
+        approval = cls(
             proposal_id=proposal.id,
             proposal_fingerprint=proposal.fingerprint(),
             policy_fingerprint=policy_fingerprint,
             approved_by=approved_by,
             expires_at=expires.isoformat(),
             reason=reason,
+            key_id=key_id,
         )
+        if signing_key is None:
+            return approval
+        signature = hmac.new(
+            signing_key, approval.canonical_payload(), hashlib.sha256
+        ).hexdigest()
+        return replace(approval, signature=signature)
 
 
 @dataclass(frozen=True, slots=True)

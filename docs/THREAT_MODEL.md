@@ -25,13 +25,16 @@ Policy construction fails if any allowed action lacks a human-owned effect class
 - irreversible effects forbidden by policy
 - absolute paths resolving outside explicit roots
 - relative paths at the trust boundary
+- unknown, missing, or nested payload fields for actions with a strict `ActionSchema`
 - non-GET/HEAD requests by default
 - literal and DNS-resolved non-public network destinations
 - selected dangerous command signatures
 - approval use against changed proposal arguments
 - approval use against a changed policy
 - expired, mismatched, or same-process replayed approvals
+- unsigned approvals and approvals signed by unknown HMAC keys
 - receipt modification detectable through a hash chain
+- an execution-started receipt written before an authorized handler runs
 
 ## Explicit non-goals and residual risks
 
@@ -40,9 +43,10 @@ Policy construction fails if any allowed action lacks a human-owned effect class
 - A path can change between verification and handler access; high-assurance handlers should use directory-relative file descriptors and platform-specific no-follow controls.
 - A hostname can resolve differently between verification and connection; network handlers must pin or re-verify the actual connected address.
 - The built-in approval nonce ledger is process-local and resets on restart. Distributed deployments need an atomic shared store.
+- The reference HMAC verifier shares signing authority with the evaluator. Use a public-key `ApprovalVerifier` when approval issuance must remain isolated from that process.
 - Pattern scanning cannot establish semantic safety and is only defense in depth.
 - Armour does not protect information already sent to a cloud model.
-- It does not authenticate human identities, sign policies, manage credentials, or enforce resource quotas yet.
+- It authenticates configured approval keys, not the real-world identity behind them; it does not sign policies, manage credentials, or enforce resource quotas yet.
 - Hash chaining exposes tampering but does not prevent deletion of the entire receipt file; external anchoring is required for stronger audit guarantees.
 
 ## Evaluation rule

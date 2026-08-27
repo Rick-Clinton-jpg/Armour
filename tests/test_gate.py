@@ -4,7 +4,10 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from armour import ActionProposal, ArmourGate, Effect, HumanApproval, Policy, Risk, Verdict
+from armour import (
+    ActionProposal, ArmourGate, Effect, HMACApprovalVerifier, HumanApproval,
+    Policy, Risk, Verdict,
+)
 from armour.verifiers import NetworkVerifier
 
 
@@ -12,6 +15,8 @@ class GateTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
+        self.approval_key = b"test-approval-key"
+        self.approval_verifier = HMACApprovalVerifier({"test-key": self.approval_key})
         self.policy = Policy(
             allowed_actions=frozenset({"read_file", "write_file", "fetch", "delete_file"}),
             action_effects={
@@ -35,6 +40,8 @@ class GateTests(unittest.TestCase):
             proposal,
             policy_fingerprint=self.policy.fingerprint(),
             approved_by="test-human",
+            signing_key=self.approval_key,
+            key_id="test-key",
             **kwargs,
         )
 
@@ -110,7 +117,9 @@ class GateTests(unittest.TestCase):
         proposal = ActionProposal(
             "delete_file", Effect.DESTRUCTIVE, Risk.HIGH, resource=str(self.root / "a.md")
         )
-        decision = ArmourGate(self.policy).evaluate(
+        decision = ArmourGate(
+            self.policy, approval_verifier=self.approval_verifier
+        ).evaluate(
             proposal, approval=self.approval(proposal)
         )
         self.assertIs(decision.verdict, Verdict.AUTHORIZED)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from typing import Any
+from uuid import uuid4
 
 from .audit import ReceiptLog
 from .gate import ArmourGate
@@ -39,6 +40,7 @@ class GuardedExecutor:
             approval=approval,
             consume_approval=True,
         )
+        execution_id = uuid4().hex
         if decision.verdict is not Verdict.AUTHORIZED:
             outcome = ExecutionOutcome(
                 proposal.id, False, error=f"Armour decision: {decision.verdict.value}"
@@ -48,6 +50,20 @@ class GuardedExecutor:
                 proposal.id, False, error="authorized action has no registered handler"
             )
         else:
+            if self.receipts is not None:
+                try:
+                    self.receipts.append(
+                        proposal,
+                        decision,
+                        phase="started",
+                        execution_id=execution_id,
+                    )
+                except Exception as exc:
+                    return ExecutionOutcome(
+                        proposal.id,
+                        False,
+                        error=f"audit start failed; handler not executed: {type(exc).__name__}",
+                    )
             try:
                 output = self._handlers[proposal.action](proposal)
                 outcome = ExecutionOutcome(proposal.id, True, output=output)
@@ -55,6 +71,19 @@ class GuardedExecutor:
                 outcome = ExecutionOutcome(
                     proposal.id, False, error=f"{type(exc).__name__}: {exc}"
                 )
-        if self.receipts:
-            self.receipts.append(proposal, decision, outcome)
+        if self.receipts is not None:
+            try:
+                self.receipts.append(
+                    proposal,
+                    decision,
+                    outcome,
+                    phase="completed",
+                    execution_id=execution_id,
+                )
+            except Exception as exc:
+                return ExecutionOutcome(
+                    proposal.id,
+                    False,
+                    error=f"audit completion failed: {type(exc).__name__}",
+                )
         return outcome

@@ -50,6 +50,7 @@ from armour import (
     ArmourGate,
     Effect,
     GuardedExecutor,
+    HMACApprovalVerifier,
     HumanApproval,
     Policy,
     ReceiptLog,
@@ -90,25 +91,32 @@ outcome = executor.execute(proposal)
 - High-risk actions require separately supplied human approval.
 - Approvals bind to the proposal ID, exact arguments, policy fingerprint, approving identity, expiry, and a single-use nonce.
 - Filesystem paths must be absolute and remain beneath explicit roots after resolution.
+- Optional `ActionSchema` contracts reject unknown payload keys and identify the exact filesystem fields shared by verification and the registered handler.
 - Network destinations are restricted to GET/HEAD and checked after DNS resolution for private, loopback, link-local, reserved, and otherwise non-public addresses.
 - Execution is limited to host-registered Python callables; proposals cannot contain executable handlers.
 - Every decision and outcome can be written to a hash-chained JSONL receipt log.
 
 Armour is a policy boundary, not a complete sandbox. Host handlers remain trusted code and must avoid time-of-check/time-of-use mistakes—for example, re-resolve network destinations at connection time and use directory-relative file APIs when hostile local filesystem races are possible.
 
-Raw model JSON should enter through `ActionProposal.from_untrusted(...)`. Human approval is represented by a `HumanApproval` bound to one exact proposal and policy version; the host—not the model—must create it through a separate trusted interaction.
+Raw model JSON should enter through `ActionProposal.from_untrusted(...)`. Human approval is represented by a signed `HumanApproval` bound to one exact proposal and policy version. Unsigned approvals are never trusted. The host—not the model—must create approvals through a separate trusted interaction.
 
 ```python
+approval_key = load_secret_from_trusted_store("ARMOUR_APPROVAL_KEY")
+approval_verifier = HMACApprovalVerifier({"review-service": approval_key})
+gate = ArmourGate(policy, approval_verifier=approval_verifier)
+
 approval = HumanApproval.issue(
     proposal,
     policy_fingerprint=policy.fingerprint(),
     approved_by="rick@example.com",
     ttl_seconds=120,
+    signing_key=approval_key,
+    key_id="review-service",
 )
-outcome = executor.execute(proposal, approval=approval)
+decision = gate.evaluate(proposal, approval=approval)
 ```
 
-The built-in nonce ledger prevents replay inside one running `ArmourGate`. A production deployment with multiple processes must provide a shared durable approval store before treating this as cross-process replay protection.
+The dependency-free HMAC verifier is suitable only where the evaluator is trusted with the shared signing secret. Deployments requiring separation between approval issuance and evaluation should implement the `ApprovalVerifier` protocol with public-key signatures. The built-in nonce ledger prevents replay inside one running `ArmourGate`; multiple processes require a shared durable approval store.
 
 ## Mutation testing and coverage
 
@@ -133,7 +141,7 @@ Mutation evaluation never executes a proposal. A mutant is “killed” when the
 
 ## Status
 
-Early-stage research prototype. The policy boundary, approval binding, receipt chain, and offline mutation harness are implemented and covered by 28 tests. Armour is suitable for experimentation and integration work, but it is not yet a production security boundary.
+Early-stage research prototype. Policy integrity checks, authenticated approval binding, staged receipt chains, and the offline mutation harness are implemented and covered by 39 tests. Armour is suitable for experimentation and integration work, but it is not yet a production security boundary.
 
 ## Files
 
@@ -141,6 +149,7 @@ Early-stage research prototype. The policy boundary, approval binding, receipt c
 | --- | --- |
 | `armour/models.py` | Typed proposals, approvals, decisions, and fingerprints |
 | `armour/policy.py` | Human-owned action, effect, filesystem, network, and risk policy |
+| `armour/schemas.py` | Strict host-owned payload contracts for individual actions |
 | `armour/verifiers.py` | Mandatory deterministic checks |
 | `armour/gate.py` | Fail-closed verdict aggregation and approval validation |
 | `armour/executor.py` | Registered-handler execution boundary |
@@ -153,6 +162,7 @@ Early-stage research prototype. The policy boundary, approval binding, receipt c
 - Armour is not an operating-system, container, process, or bytecode sandbox.
 - Registered handlers remain trusted code and can violate policy if incorrectly written.
 - Filesystem and DNS checks have time-of-check/time-of-use risks that handlers must address.
+- HMAC approval verification does not isolate signing authority from the evaluator; use a public-key `ApprovalVerifier` when that separation is required.
 - Approval replay protection is process-local; distributed deployments need an atomic shared store.
 - Pattern scanning is defense in depth, not semantic proof.
 - Armour cannot protect information already sent to a cloud model.

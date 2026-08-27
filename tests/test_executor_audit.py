@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 from armour import (
-    ActionProposal, ArmourGate, Effect, GuardedExecutor, HumanApproval,
+    ActionProposal, ArmourGate, Effect, GuardedExecutor, HMACApprovalVerifier, HumanApproval,
     Policy, ReceiptLog, Risk,
 )
 
@@ -68,13 +68,22 @@ class ExecutorAuditTests(unittest.TestCase):
             allowed_actions=frozenset({"delete"}),
             action_effects={"delete": Effect.DESTRUCTIVE},
         )
-        executor = GuardedExecutor(ArmourGate(policy), log)
+        approval_key = b"test-approval-key"
+        executor = GuardedExecutor(
+            ArmourGate(
+                policy,
+                approval_verifier=HMACApprovalVerifier({"test-key": approval_key}),
+            ),
+            log,
+        )
         executor.register("delete", lambda proposal: "done")
         proposal = ActionProposal("delete", Effect.READ_ONLY, Risk.LOW)
         approval = HumanApproval.issue(
             proposal,
             policy_fingerprint=policy.fingerprint(),
             approved_by="test-human",
+            signing_key=approval_key,
+            key_id="test-key",
         )
         self.assertTrue(executor.execute(proposal, approval=approval).success)
         record = json.loads(log.path.read_text().splitlines()[0])
