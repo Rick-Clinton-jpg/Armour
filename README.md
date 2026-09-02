@@ -60,6 +60,7 @@ from armour import (
     Policy,
     ReceiptLog,
     Risk,
+    SQLiteApprovalLedger,
 )
 
 workspace = Path("/srv/agent-workspace")
@@ -108,7 +109,15 @@ Raw model JSON should enter through `ActionProposal.from_untrusted(...)`. Human 
 ```python
 approval_key = load_secret_from_trusted_store("ARMOUR_APPROVAL_KEY")
 approval_verifier = HMACApprovalVerifier({"review-service": approval_key})
-gate = ArmourGate(policy, approval_verifier=approval_verifier)
+approval_ledger = SQLiteApprovalLedger(
+    workspace / "armour-approvals.sqlite3",
+    deployment_namespace="notes-production",
+)
+gate = ArmourGate.production(
+    policy,
+    approval_verifier=approval_verifier,
+    approval_ledger=approval_ledger,
+)
 
 approval = HumanApproval.issue(
     proposal,
@@ -121,7 +130,9 @@ approval = HumanApproval.issue(
 decision = gate.evaluate(proposal, approval=approval)
 ```
 
-The dependency-free HMAC verifier is suitable only where the evaluator is trusted with the shared signing secret. Deployments requiring separation between approval issuance and evaluation should implement the `ApprovalVerifier` protocol with public-key signatures. The built-in nonce ledger prevents replay inside one running `ArmourGate`; multiple processes require a shared durable approval store.
+The dependency-free HMAC verifier is suitable only where the evaluator is trusted with the shared signing secret. Deployments requiring separation between approval issuance and evaluation should implement the `ApprovalVerifier` protocol with public-key signatures. `SQLiteApprovalLedger` atomically consumes approval nonces across process restarts and multiple Armour processes sharing the same database. Policy and key changes do not reset nonce history. Production construction fails closed unless both trusted approval verification and durable replay storage are configured.
+
+Valid approvals are consumed by `evaluate()` by default, including when a caller uses the gate directly. `consume_approval=False` is an explicit preview mode; its result must never be treated as execution authority.
 
 ## Mutation testing and coverage
 
@@ -146,7 +157,7 @@ Mutation evaluation never executes a proposal. A mutant is “killed” when the
 
 ## Status
 
-Early-stage research prototype and active work in progress. Policy integrity checks, authenticated approval binding, staged receipt chains, and the offline mutation harness are implemented and covered by 39 tests. These tests are evidence about the cases exercised, not a security certification. Armour is not recommended for production or security-critical use at this stage; evaluation and use are entirely at the user's own risk.
+Early-stage research prototype and active work in progress. Policy integrity checks, authenticated approval binding, durable atomic approval replay protection, staged receipt chains, and the offline mutation harness are implemented and covered by 50 tests. These tests are evidence about the cases exercised, not a security certification. Armour is not recommended for production or security-critical use at this stage; evaluation and use are entirely at the user's own risk.
 
 ## Files
 
@@ -157,6 +168,7 @@ Early-stage research prototype and active work in progress. Policy integrity che
 | `armour/schemas.py` | Strict host-owned payload contracts for individual actions |
 | `armour/verifiers.py` | Mandatory deterministic checks |
 | `armour/gate.py` | Fail-closed verdict aggregation and approval validation |
+| `armour/ledger.py` | Atomic in-memory and durable SQLite approval replay protection |
 | `armour/executor.py` | Registered-handler execution boundary |
 | `armour/audit.py` | Hash-chained JSONL receipts |
 | `armour/evaluation.py` | Offline mutant families and invariant coverage |
@@ -168,7 +180,8 @@ Early-stage research prototype and active work in progress. Policy integrity che
 - Registered handlers remain trusted code and can violate policy if incorrectly written.
 - Filesystem and DNS checks have time-of-check/time-of-use risks that handlers must address.
 - HMAC approval verification does not isolate signing authority from the evaluator; use a public-key `ApprovalVerifier` when that separation is required.
-- Approval replay protection is process-local; distributed deployments need an atomic shared store.
+- Development mode uses process-local replay protection unless `SQLiteApprovalLedger` is supplied; production mode refuses that fallback.
+- SQLite protects concurrent processes sharing one database file, not hosts that do not share an atomic store.
 - Pattern scanning is defense in depth, not semantic proof.
 - Armour cannot protect information already sent to a cloud model.
 - Receipt hash chaining detects modification but cannot prevent deletion of the entire receipt file.

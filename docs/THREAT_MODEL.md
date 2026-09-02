@@ -11,6 +11,7 @@ An untrusted model may propose actions and arguments. It must not be able to mak
 - Armour's mandatory verifier chain and gate
 - registered handler implementations
 - the human-approval issuance channel
+- the configured approval replay ledger and its storage
 - any credential, filesystem, network, and audit services used by handlers
 
 The model, prompts, retrieved content, memory, proposal fields, and model-declared risk/effect are untrusted.
@@ -31,7 +32,7 @@ Policy construction fails if any allowed action lacks a human-owned effect class
 - selected dangerous command signatures
 - approval use against changed proposal arguments
 - approval use against a changed policy
-- expired, mismatched, or same-process replayed approvals
+- expired, mismatched, or replayed approvals, including after restart and across processes sharing a SQLite ledger
 - unsigned approvals and approvals signed by unknown HMAC keys
 - receipt modification detectable through a hash chain
 - an execution-started receipt written before an authorized handler runs
@@ -42,7 +43,9 @@ Policy construction fails if any allowed action lacks a human-owned effect class
 - Registered handlers are trusted and can violate policy if incorrectly written.
 - A path can change between verification and handler access; high-assurance handlers should use directory-relative file descriptors and platform-specific no-follow controls.
 - A hostname can resolve differently between verification and connection; network handlers must pin or re-verify the actual connected address.
-- The built-in approval nonce ledger is process-local and resets on restart. Distributed deployments need an atomic shared store.
+- Development mode falls back to a process-local approval ledger. Production mode requires durable replay storage.
+- `SQLiteApprovalLedger` coordinates processes sharing one database file; separate hosts require a host-provided atomic `ApprovalLedger` implementation.
+- An attacker able to replace or roll back the replay database can undermine nonce history; protect the ledger as security state.
 - The reference HMAC verifier shares signing authority with the evaluator. Use a public-key `ApprovalVerifier` when approval issuance must remain isolated from that process.
 - Pattern scanning cannot establish semantic safety and is only defense in depth.
 - Armour does not protect information already sent to a cloud model.

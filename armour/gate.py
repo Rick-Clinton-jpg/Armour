@@ -5,9 +5,12 @@ from __future__ import annotations
 from collections.abc import Iterable
 from datetime import datetime, timezone
 import logging
-from threading import Lock
 
 from .approvals import ApprovalVerifier
+from .ledger import (
+    ApprovalLedger,
+    InMemoryApprovalLedger,
+)
 from .models import ActionProposal, CheckResult, Decision, HumanApproval, Risk, Verdict
 from .policy import Policy
 from .verifiers import (
@@ -31,9 +34,28 @@ class ArmourGate:
         network_verifier: object | None = None,
         additional_verifiers: Iterable[object] = (),
         approval_verifier: ApprovalVerifier | None = None,
+        approval_ledger: ApprovalLedger | None = None,
+        production_mode: bool = False,
     ):
         self.policy = policy
         self.approval_verifier = approval_verifier
+        self.approval_ledger = (
+            approval_ledger
+            if approval_ledger is not None
+            else InMemoryApprovalLedger()
+        )
+        if not isinstance(getattr(self.approval_ledger, "durable", None), bool):
+            raise TypeError("approval ledger must declare whether it is durable")
+        self.production_mode = production_mode
+        if production_mode and approval_verifier is None:
+            raise ValueError("production mode requires a trusted approval verifier")
+        if production_mode and not self.approval_ledger.durable:
+            raise ValueError("production mode requires a durable approval ledger")
+        if approval_verifier is not None and not self.approval_ledger.durable:
+            logger.warning(
+                "signed approvals are using process-local replay protection; "
+                "configure a durable ledger or production mode"
+            )
         # Core checks are mandatory. Callers may add checks, never replace them.
         self.verifiers = (
             ActionVerifier(),
@@ -44,8 +66,38 @@ class ArmourGate:
             DangerousContentVerifier(),
             *tuple(additional_verifiers),
         )
-        self._approval_lock = Lock()
-        self._used_approval_nonces: set[str] = set()
+
+    @classmethod
+    def production(
+        cls,
+        policy: Policy,
+        *,
+        approval_verifier: ApprovalVerifier,
+        approval_ledger: ApprovalLedger,
+        **kwargs: object,
+    ) -> "ArmourGate":
+        """Construct a gate that refuses development-only approval controls."""
+        return cls(
+            policy,
+            approval_verifier=approval_verifier,
+            approval_ledger=approval_ledger,
+            production_mode=True,
+            **kwargs,
+        )
+
+    def security_report(self) -> dict[str, object]:
+        """Describe the protections actually active for this gate."""
+        weaknesses: list[str] = []
+        if self.approval_verifier is None:
+            weaknesses.append("trusted approval verifier is not configured")
+        if not self.approval_ledger.durable:
+            weaknesses.append("approval replay protection is process-local")
+        return {
+            "production_mode": self.production_mode,
+            "approval_verification": self.approval_verifier is not None,
+            "durable_approval_replay": self.approval_ledger.durable,
+            "weaknesses": tuple(weaknesses),
+        }
 
     def evaluate(
         self,
@@ -53,8 +105,13 @@ class ArmourGate:
         *,
         request_risk: Risk = Risk.LOW,
         approval: HumanApproval | None = None,
-        consume_approval: bool = False,
+        consume_approval: bool = True,
     ) -> Decision:
+        """Evaluate a proposal and atomically consume any valid approval.
+
+        ``consume_approval=False`` is an explicit preview mode. A preview
+        decision must never be used as authority to execute the proposal.
+        """
         checks: list[CheckResult] = []
         try:
             policy_fingerprint = self.policy.fingerprint()
@@ -123,12 +180,15 @@ class ArmourGate:
         if effective_risk >= self.policy.human_gate_at:
             approved, approval_reason = self._validate_approval(proposal, approval)
             if approved and consume_approval:
-                with self._approval_lock:
-                    if approval.nonce in self._used_approval_nonces:
+                try:
+                    claimed = self.approval_ledger.claim(approval)
+                    if claimed is not True:
                         approved = False
                         approval_reason = "approval nonce already consumed"
-                    else:
-                        self._used_approval_nonces.add(approval.nonce)
+                except Exception:
+                    logger.exception("approval replay ledger failed closed")
+                    approved = False
+                    approval_reason = "approval replay ledger unavailable"
         if effective_risk >= self.policy.human_gate_at and not approved:
             return Decision(
                 proposal_id=proposal.id,
@@ -201,7 +261,4 @@ class ArmourGate:
             return False, "approval provenance verification failed"
         if not trusted:
             return False, "approval signature is not trusted"
-        with self._approval_lock:
-            if approval.nonce in self._used_approval_nonces:
-                return False, "approval nonce already consumed"
         return True, ""

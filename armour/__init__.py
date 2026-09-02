@@ -12,6 +12,13 @@ from .evaluation import (
     standard_mutant_family,
 )
 from .gate import ArmourGate
+from .ledger import (
+    ApprovalClaim,
+    ApprovalLedger,
+    ApprovalLedgerError,
+    InMemoryApprovalLedger,
+    SQLiteApprovalLedger,
+)
 from .models import ActionProposal, Decision, Effect, ExecutionOutcome, HumanApproval, Risk, Verdict
 from .policy import Policy
 from .schemas import ActionSchema
@@ -20,6 +27,9 @@ __all__ = [
     "ActionProposal",
     "ActionSchema",
     "ApprovalVerifier",
+    "ApprovalClaim",
+    "ApprovalLedger",
+    "ApprovalLedgerError",
     "ArmourGate",
     "Decision",
     "Effect",
@@ -27,6 +37,7 @@ __all__ = [
     "GuardedExecutor",
     "HumanApproval",
     "HMACApprovalVerifier",
+    "InMemoryApprovalLedger",
     "Mutation",
     "MutationOutcome",
     "MutationReport",
@@ -36,6 +47,7 @@ __all__ = [
     "ReceiptIntegrityError",
     "ReceiptVerification",
     "Risk",
+    "SQLiteApprovalLedger",
     "STANDARD_INVARIANTS",
     "Verdict",
     "standard_mutant_family",
