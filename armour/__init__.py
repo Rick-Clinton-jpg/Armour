@@ -24,7 +24,16 @@ from .ledger import (
     InMemoryApprovalLedger,
     SQLiteApprovalLedger,
 )
-from .models import ActionProposal, Decision, Effect, ExecutionOutcome, HumanApproval, Risk, Verdict
+from .models import (
+    ActionProposal,
+    AuditStatus,
+    Decision,
+    Effect,
+    ExecutionOutcome,
+    HumanApproval,
+    Risk,
+    Verdict,
+)
 from .policy import Policy
 from .schemas import ActionSchema
 
@@ -36,6 +45,7 @@ __all__ = [
     "ApprovalLedger",
     "ApprovalLedgerError",
     "ArmourGate",
+    "AuditStatus",
     "Decision",
     "Ed25519ApprovalSigner",
     "Ed25519ApprovalVerifier",

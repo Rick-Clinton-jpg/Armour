@@ -51,6 +51,20 @@ class Verdict(StrEnum):
     ESCALATED = "escalated"
 
 
+class AuditStatus(StrEnum):
+    """Whether execution evidence was durably recorded.
+
+    This is deliberately separate from ``ExecutionOutcome.success``. A handler
+    may complete successfully even when the completion receipt cannot be
+    persisted; collapsing those states invites unsafe retries.
+    """
+
+    NOT_CONFIGURED = "not_configured"
+    COMPLETED = "completed"
+    START_FAILED = "start_failed"
+    COMPLETION_FAILED = "completion_failed"
+
+
 @dataclass(frozen=True, slots=True)
 class ActionProposal:
     """Untrusted action proposed by an agent or model."""
@@ -223,7 +237,18 @@ class Decision:
 
 @dataclass(frozen=True, slots=True)
 class ExecutionOutcome:
+    """The handler result and audit result for one execution attempt.
+
+    ``success`` reports whether the registered handler returned normally. It
+    never changes merely because completion auditing failed. Callers should
+    inspect ``audit_status`` separately and must not retry a successful handler
+    solely because its completion receipt is incomplete.
+    """
+
     proposal_id: str
     success: bool
     output: Any = None
     error: str | None = None
+    execution_id: str | None = None
+    audit_status: AuditStatus = AuditStatus.NOT_CONFIGURED
+    audit_error: str | None = None

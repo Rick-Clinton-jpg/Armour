@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 import os
 from pathlib import Path
 import sqlite3
 from threading import Lock
 import time
-from typing import Protocol
+from typing import Iterator, Protocol
 
 from .models import HumanApproval
 
@@ -95,6 +96,20 @@ class SQLiteApprovalLedger:
         connection.execute("PRAGMA synchronous = FULL")
         return connection
 
+    @contextmanager
+    def _connection(self) -> Iterator[sqlite3.Connection]:
+        """Yield a connection and always release its file descriptor.
+
+        ``sqlite3.Connection``'s own context manager commits or rolls back but
+        does not close the connection, so using it directly leaks resources
+        under repeated claims.
+        """
+        connection = self._connect()
+        try:
+            yield connection
+        finally:
+            connection.close()
+
     def _initialize(self) -> None:
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -109,7 +124,7 @@ class SQLiteApprovalLedger:
             else:
                 os.close(descriptor)
             os.chmod(self.path, 0o600)
-            with self._connect() as connection:
+            with self._connection() as connection:
                 connection.execute("PRAGMA journal_mode = WAL")
                 connection.execute("BEGIN IMMEDIATE")
                 connection.execute(
@@ -162,7 +177,7 @@ class SQLiteApprovalLedger:
 
     def claim(self, approval: HumanApproval) -> bool:
         try:
-            with self._connect() as connection:
+            with self._connection() as connection:
                 connection.execute("BEGIN IMMEDIATE")
                 try:
                     connection.execute(
@@ -205,7 +220,7 @@ class SQLiteApprovalLedger:
     def claims(self) -> tuple[ApprovalClaim, ...]:
         """Return durable claim evidence in insertion order."""
         try:
-            with self._connect() as connection:
+            with self._connection() as connection:
                 rows = connection.execute(
                     """
                     SELECT deployment_namespace, nonce, proposal_id,

@@ -4,8 +4,8 @@ import unittest
 from pathlib import Path
 
 from armour import (
-    ActionProposal, ArmourGate, Effect, GuardedExecutor, HMACApprovalVerifier, HumanApproval,
-    Policy, ReceiptLog, Risk,
+    ActionProposal, ArmourGate, AuditStatus, Effect, GuardedExecutor,
+    HMACApprovalVerifier, HumanApproval, Policy, ReceiptLog, Risk,
 )
 
 
@@ -39,9 +39,67 @@ class ExecutorAuditTests(unittest.TestCase):
         outcome = executor.execute(proposal)
         self.assertTrue(outcome.success)
         self.assertEqual(outcome.output, "hello")
+        self.assertIs(outcome.audit_status, AuditStatus.COMPLETED)
+        self.assertIsNone(outcome.audit_error)
         self.assertTrue(log.verify())
-        record = json.loads(log.path.read_text().splitlines()[0])
-        self.assertEqual(record["decision"]["verdict"], "authorized")
+        records = [json.loads(line) for line in log.path.read_text().splitlines()]
+        self.assertEqual(records[0]["decision"]["verdict"], "authorized")
+        self.assertEqual(records[1]["outcome"]["audit_status"], "completed")
+
+    def test_completion_audit_failure_preserves_success_and_output(self):
+        class CompletionFailingReceipts:
+            def append(self, _proposal, _decision, _outcome=None, *, phase, execution_id):
+                if phase == "completed":
+                    raise OSError("disk full")
+
+        effects = []
+        executor = self.executor({"send"}, CompletionFailingReceipts())
+        executor.register("send", lambda _proposal: effects.append("sent") or "message-id")
+
+        outcome = executor.execute(ActionProposal("send", Effect.READ_ONLY, Risk.LOW))
+
+        self.assertEqual(effects, ["sent"])
+        self.assertTrue(outcome.success)
+        self.assertEqual(outcome.output, "message-id")
+        self.assertIsNone(outcome.error)
+        self.assertIs(outcome.audit_status, AuditStatus.COMPLETION_FAILED)
+        self.assertEqual(outcome.audit_error, "audit completion failed: OSError")
+        self.assertIsNotNone(outcome.execution_id)
+
+    def test_start_audit_failure_never_runs_handler(self):
+        class StartFailingReceipts:
+            def append(self, _proposal, _decision, _outcome=None, *, phase, execution_id):
+                raise OSError("disk unavailable")
+
+        effects = []
+        executor = self.executor({"send"}, StartFailingReceipts())
+        executor.register("send", lambda _proposal: effects.append("sent"))
+
+        outcome = executor.execute(ActionProposal("send", Effect.READ_ONLY, Risk.LOW))
+
+        self.assertEqual(effects, [])
+        self.assertFalse(outcome.success)
+        self.assertIs(outcome.audit_status, AuditStatus.START_FAILED)
+        self.assertEqual(outcome.audit_error, "audit start failed: OSError")
+
+    def test_completion_audit_failure_preserves_handler_failure(self):
+        class CompletionFailingReceipts:
+            def append(self, _proposal, _decision, _outcome=None, *, phase, execution_id):
+                if phase == "completed":
+                    raise OSError("disk full")
+
+        executor = self.executor({"send"}, CompletionFailingReceipts())
+
+        def fail(_proposal):
+            raise RuntimeError("handler failed")
+
+        executor.register("send", fail)
+        outcome = executor.execute(ActionProposal("send", Effect.READ_ONLY, Risk.LOW))
+
+        self.assertFalse(outcome.success)
+        self.assertEqual(outcome.error, "RuntimeError: handler failed")
+        self.assertIs(outcome.audit_status, AuditStatus.COMPLETION_FAILED)
+        self.assertEqual(outcome.audit_error, "audit completion failed: OSError")
 
     def test_tampered_receipt_chain_is_detected(self):
         log = ReceiptLog(self.root / "receipts.jsonl")

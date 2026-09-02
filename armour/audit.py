@@ -108,6 +108,9 @@ class ReceiptLog:
                     "success": outcome.success,
                     "output": _sanitize(outcome.output),
                     "error": outcome.error,
+                    "execution_id": outcome.execution_id,
+                    "audit_status": outcome.audit_status.value,
+                    "audit_error": outcome.audit_error,
                 },
             }
             canonical = json.dumps(record, sort_keys=True, separators=(",", ":"), default=str)

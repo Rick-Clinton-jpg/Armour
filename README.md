@@ -104,6 +104,10 @@ outcome = executor.execute(proposal)
 - Network destinations are restricted to GET/HEAD and checked after DNS resolution for private, loopback, link-local, reserved, and otherwise non-public addresses.
 - Execution is limited to host-registered Python callables; proposals cannot contain executable handlers.
 - Every decision and outcome can be written to a hash-chained JSONL receipt log.
+- Handler success and audit success are reported separately. If a completion
+  receipt fails after a handler returns, Armour preserves the successful output
+  and reports `audit_status="completion_failed"`; callers must not retry the
+  effect solely because its audit record is incomplete.
 
 Armour is a policy boundary, not a complete sandbox. Host handlers remain trusted code and must avoid time-of-check/time-of-use mistakes—for example, re-resolve network destinations at connection time and use directory-relative file APIs when hostile local filesystem races are possible.
 
@@ -174,7 +178,7 @@ Mutation evaluation never executes a proposal. A mutant is “killed” when the
 
 ## Status
 
-Early-stage research prototype and active work in progress. Policy integrity checks, HMAC and Ed25519 approval binding, durable atomic approval replay protection, staged receipt chains, and the offline mutation harness are implemented and covered by 57 tests. These tests are evidence about the cases exercised, not a security certification. Armour is not recommended for production or security-critical use at this stage; evaluation and use are entirely at the user's own risk.
+Early-stage research prototype and active work in progress. Policy integrity checks, HMAC and Ed25519 approval binding, durable atomic approval replay protection, staged receipt chains, explicit execution/audit outcomes, and the offline mutation harness are implemented and covered by the test suite. These tests are evidence about the cases exercised, not a security certification. Armour is not recommended for production or security-critical use at this stage; evaluation and use are entirely at the user's own risk.
 
 ## Files
 
@@ -204,6 +208,9 @@ Early-stage research prototype and active work in progress. Policy integrity che
 - Pattern scanning is defense in depth, not semantic proof.
 - Armour cannot protect information already sent to a cloud model.
 - Receipt hash chaining detects modification but cannot prevent deletion of the entire receipt file.
+- A completion-audit failure is reported separately from handler success. Hosts
+  still need idempotent handlers or downstream idempotency keys to recover safely
+  from process crashes and ambiguous external effects.
 
 See [`docs/THREAT_MODEL.md`](./docs/THREAT_MODEL.md) for the complete boundary.
 

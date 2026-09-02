@@ -37,6 +37,8 @@ Policy construction fails if any allowed action lacks a human-owned effect class
 - separated Ed25519 verification in which the evaluator holds no approval-signing secret
 - receipt modification detectable through a hash chain
 - an execution-started receipt written before an authorized handler runs
+- completion-receipt failure reported separately from handler success, without
+  discarding a successful handler result
 
 ## Explicit non-goals and residual risks
 
@@ -53,6 +55,9 @@ Policy construction fails if any allowed action lacks a human-owned effect class
 - Armour does not protect information already sent to a cloud model.
 - It authenticates configured approval keys, not the real-world identity behind them; it does not sign policies, manage credentials, or enforce resource quotas yet.
 - Hash chaining exposes tampering but does not prevent deletion of the entire receipt file; external anchoring is required for stronger audit guarantees.
+- Process failure during an external side effect can still leave its outcome
+  uncertain. Handlers or downstream services must honour an idempotency key for
+  safe retry; Armour's staged receipts alone cannot provide exactly-once effects.
 
 ## Evaluation rule
 
