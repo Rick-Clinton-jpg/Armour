@@ -64,6 +64,7 @@ from armour import (
     Policy,
     ReceiptLog,
     Risk,
+    read_text_beneath,
 )
 
 workspace = Path("/srv/agent-workspace")
@@ -80,7 +81,12 @@ policy = Policy(
 executor = GuardedExecutor(
     ArmourGate(policy), ReceiptLog(workspace / "receipts.jsonl")
 )
-executor.register("read_note", lambda proposal: Path(proposal.resource).read_text())
+executor.register(
+    "read_note",
+    lambda proposal: read_text_beneath(
+        workspace, Path(proposal.resource).relative_to(workspace)
+    ),
+)
 
 proposal = ActionProposal(
     action="read_note",
@@ -109,7 +115,7 @@ outcome = executor.execute(proposal)
   and reports `audit_status="completion_failed"`; callers must not retry the
   effect solely because its audit record is incomplete.
 
-Armour is a policy boundary, not a complete sandbox. Host handlers remain trusted code and must avoid time-of-check/time-of-use mistakes—for example, re-resolve network destinations at connection time and use directory-relative file APIs when hostile local filesystem races are possible.
+Armour is a policy boundary, not a complete sandbox. Host handlers remain trusted code and must avoid time-of-check/time-of-use mistakes—for example, re-resolve network destinations at connection time. For supported POSIX platforms, `read_text_beneath()` and `open_beneath()` provide directory-relative, no-follow filesystem access so a handler does not reopen a previously verified path by name. Other filesystem operations still require equivalently safe host implementations.
 
 Raw model JSON should enter through `ActionProposal.from_untrusted(...)`. Human approval is represented by a signed `HumanApproval` bound to one exact proposal and policy version. Unsigned approvals are never trusted. The host—not the model—must create approvals through a separate trusted interaction.
 
@@ -194,6 +200,7 @@ Early-stage research prototype and active work in progress. Policy integrity che
 | `armour/executor.py` | Registered-handler execution boundary |
 | `armour/audit.py` | Hash-chained JSONL receipts |
 | `armour/evaluation.py` | Offline mutant families and invariant coverage |
+| `armour/safe_filesystem.py` | Directory-relative, no-follow file primitives |
 | `docs/THREAT_MODEL.md` | Trusted base, defended cases, and residual risks |
 
 ## Honest limitations

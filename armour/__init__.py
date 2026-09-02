@@ -35,6 +35,7 @@ from .models import (
     Verdict,
 )
 from .policy import Policy
+from .safe_filesystem import UnsafePathError, open_beneath, read_text_beneath
 from .schemas import ActionSchema
 
 __all__ = [
@@ -66,6 +67,9 @@ __all__ = [
     "Risk",
     "SQLiteApprovalLedger",
     "STANDARD_INVARIANTS",
+    "UnsafePathError",
     "Verdict",
+    "open_beneath",
+    "read_text_beneath",
     "standard_mutant_family",
 ]
