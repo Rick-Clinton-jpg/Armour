@@ -33,7 +33,8 @@ Policy construction fails if any allowed action lacks a human-owned effect class
 - approval use against changed proposal arguments
 - approval use against a changed policy
 - expired, mismatched, or replayed approvals, including after restart and across processes sharing a SQLite ledger
-- unsigned approvals and approvals signed by unknown HMAC keys
+- unsigned approvals and approvals signed by unknown HMAC or Ed25519 keys
+- separated Ed25519 verification in which the evaluator holds no approval-signing secret
 - receipt modification detectable through a hash chain
 - an execution-started receipt written before an authorized handler runs
 
@@ -46,7 +47,8 @@ Policy construction fails if any allowed action lacks a human-owned effect class
 - Development mode falls back to a process-local approval ledger. Production mode requires durable replay storage.
 - `SQLiteApprovalLedger` coordinates processes sharing one database file; separate hosts require a host-provided atomic `ApprovalLedger` implementation.
 - An attacker able to replace or roll back the replay database can undermine nonce history; protect the ledger as security state.
-- The reference HMAC verifier shares signing authority with the evaluator. Use a public-key `ApprovalVerifier` when approval issuance must remain isolated from that process.
+- The reference HMAC verifier shares signing authority with the evaluator. Use `Ed25519ApprovalVerifier` when approval issuance must remain isolated from that process.
+- Ed25519 key distribution, storage, rotation timing, and real-world reviewer identity remain the host's responsibility.
 - Pattern scanning cannot establish semantic safety and is only defense in depth.
 - Armour does not protect information already sent to a cloud model.
 - It authenticates configured approval keys, not the real-world identity behind them; it does not sign policies, manage credentials, or enforce resource quotas yet.

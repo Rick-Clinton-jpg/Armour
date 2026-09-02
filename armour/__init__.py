@@ -1,6 +1,11 @@
 """Armour: a deterministic safety boundary for autonomous agents."""
 
-from .approvals import ApprovalVerifier, HMACApprovalVerifier
+from .approvals import (
+    ApprovalVerifier,
+    Ed25519ApprovalSigner,
+    Ed25519ApprovalVerifier,
+    HMACApprovalVerifier,
+)
 from .audit import ReceiptIntegrityError, ReceiptLog, ReceiptVerification
 from .executor import GuardedExecutor
 from .evaluation import (
@@ -32,6 +37,8 @@ __all__ = [
     "ApprovalLedgerError",
     "ArmourGate",
     "Decision",
+    "Ed25519ApprovalSigner",
+    "Ed25519ApprovalVerifier",
     "Effect",
     "ExecutionOutcome",
     "GuardedExecutor",

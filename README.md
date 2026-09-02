@@ -19,6 +19,12 @@ cd Armour
 pip install -e .
 ```
 
+Install the optional cryptographic support for separated Ed25519 approval signing and verification:
+
+```bash
+pip install -e '.[crypto]'
+```
+
 ## Trust boundary
 
 ```text
@@ -55,12 +61,9 @@ from armour import (
     ArmourGate,
     Effect,
     GuardedExecutor,
-    HMACApprovalVerifier,
-    HumanApproval,
     Policy,
     ReceiptLog,
     Risk,
-    SQLiteApprovalLedger,
 )
 
 workspace = Path("/srv/agent-workspace")
@@ -106,9 +109,31 @@ Armour is a policy boundary, not a complete sandbox. Host handlers remain truste
 
 Raw model JSON should enter through `ActionProposal.from_untrusted(...)`. Human approval is represented by a signed `HumanApproval` bound to one exact proposal and policy version. Unsigned approvals are never trusted. The host—not the model—must create approvals through a separate trusted interaction.
 
+For separated deployments, the approval service holds the Ed25519 private key:
+
 ```python
-approval_key = load_secret_from_trusted_store("ARMOUR_APPROVAL_KEY")
-approval_verifier = HMACApprovalVerifier({"review-service": approval_key})
+from armour import Ed25519ApprovalSigner
+
+approval_signer = Ed25519ApprovalSigner(
+    "review-service-2026-01",
+    load_secret_from_trusted_store("ARMOUR_ED25519_PRIVATE_KEY"),
+)
+approval = approval_signer.issue(
+    proposal,
+    policy_fingerprint=policy.fingerprint(),
+    approved_by="rick@example.com",
+    ttl_seconds=120,
+)
+```
+
+The Armour evaluator receives only the corresponding raw public key:
+
+```python
+from armour import ArmourGate, Ed25519ApprovalVerifier, SQLiteApprovalLedger
+
+approval_verifier = Ed25519ApprovalVerifier(
+    {"review-service-2026-01": load_public_key("armour-review.pub")}
+)
 approval_ledger = SQLiteApprovalLedger(
     workspace / "armour-approvals.sqlite3",
     deployment_namespace="notes-production",
@@ -119,18 +144,10 @@ gate = ArmourGate.production(
     approval_ledger=approval_ledger,
 )
 
-approval = HumanApproval.issue(
-    proposal,
-    policy_fingerprint=policy.fingerprint(),
-    approved_by="rick@example.com",
-    ttl_seconds=120,
-    signing_key=approval_key,
-    key_id="review-service",
-)
 decision = gate.evaluate(proposal, approval=approval)
 ```
 
-The dependency-free HMAC verifier is suitable only where the evaluator is trusted with the shared signing secret. Deployments requiring separation between approval issuance and evaluation should implement the `ApprovalVerifier` protocol with public-key signatures. `SQLiteApprovalLedger` atomically consumes approval nonces across process restarts and multiple Armour processes sharing the same database. Policy and key changes do not reset nonce history. Production construction fails closed unless both trusted approval verification and durable replay storage are configured.
+`Ed25519ApprovalVerifier` supports key rotation by accepting an explicit map of currently trusted public keys; removing a key ID revokes future approvals from it. The dependency-free `HMACApprovalVerifier` remains available for environments where the evaluator is trusted with the shared signing secret. `SQLiteApprovalLedger` atomically consumes approval nonces across process restarts and multiple Armour processes sharing the same database. Policy and key changes do not reset nonce history. Production construction fails closed unless both trusted approval verification and durable replay storage are configured.
 
 Valid approvals are consumed by `evaluate()` by default, including when a caller uses the gate directly. `consume_approval=False` is an explicit preview mode; its result must never be treated as execution authority.
 
@@ -157,13 +174,14 @@ Mutation evaluation never executes a proposal. A mutant is “killed” when the
 
 ## Status
 
-Early-stage research prototype and active work in progress. Policy integrity checks, authenticated approval binding, durable atomic approval replay protection, staged receipt chains, and the offline mutation harness are implemented and covered by 50 tests. These tests are evidence about the cases exercised, not a security certification. Armour is not recommended for production or security-critical use at this stage; evaluation and use are entirely at the user's own risk.
+Early-stage research prototype and active work in progress. Policy integrity checks, HMAC and Ed25519 approval binding, durable atomic approval replay protection, staged receipt chains, and the offline mutation harness are implemented and covered by 57 tests. These tests are evidence about the cases exercised, not a security certification. Armour is not recommended for production or security-critical use at this stage; evaluation and use are entirely at the user's own risk.
 
 ## Files
 
 | Path | What it does |
 | --- | --- |
 | `armour/models.py` | Typed proposals, approvals, decisions, and fingerprints |
+| `armour/approvals.py` | HMAC and separated Ed25519 approval provenance |
 | `armour/policy.py` | Human-owned action, effect, filesystem, network, and risk policy |
 | `armour/schemas.py` | Strict host-owned payload contracts for individual actions |
 | `armour/verifiers.py` | Mandatory deterministic checks |
@@ -179,7 +197,8 @@ Early-stage research prototype and active work in progress. Policy integrity che
 - Armour is not an operating-system, container, process, or bytecode sandbox.
 - Registered handlers remain trusted code and can violate policy if incorrectly written.
 - Filesystem and DNS checks have time-of-check/time-of-use risks that handlers must address.
-- HMAC approval verification does not isolate signing authority from the evaluator; use a public-key `ApprovalVerifier` when that separation is required.
+- HMAC approval verification does not isolate signing authority from the evaluator; use the optional Ed25519 signer/verifier when that separation is required.
+- Armour validates configured public keys but does not operate a certificate authority, distribute keys, or automatically expire signing keys.
 - Development mode uses process-local replay protection unless `SQLiteApprovalLedger` is supplied; production mode refuses that fallback.
 - SQLite protects concurrent processes sharing one database file, not hosts that do not share an atomic store.
 - Pattern scanning is defense in depth, not semantic proof.

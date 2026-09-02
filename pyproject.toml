@@ -12,5 +12,8 @@ license = {text = "PolyForm-Noncommercial-1.0.0"}
 authors = [{name = "Rick Clinton"}]
 dependencies = []
 
+[project.optional-dependencies]
+crypto = ["cryptography>=42"]
+
 [tool.setuptools.packages.find]
 include = ["armour*"]
