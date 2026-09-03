@@ -117,6 +117,40 @@ outcome = executor.execute(proposal)
 
 Armour is a policy boundary, not a complete sandbox. Host handlers remain trusted code and must avoid time-of-check/time-of-use mistakes—for example, re-resolve network destinations at connection time. For supported POSIX platforms, `read_text_beneath()` and `open_beneath()` provide directory-relative, no-follow filesystem access so a handler does not reopen a previously verified path by name. Other filesystem operations still require equivalently safe host implementations.
 
+### Filesystem execution binding (experimental)
+
+Actions can require a host-owned filesystem dependency and receive the
+already-open file capability that Armour verified:
+
+```python
+from armour import DependencyPolicy, FilesystemBinder
+
+bound_policy = Policy(
+    allowed_actions=frozenset({"read_note"}),
+    action_effects={"read_note": Effect.READ_ONLY},
+    allowed_roots=(workspace,),
+    action_dependencies={
+        "read_note": {
+            "resource": DependencyPolicy(kind="filesystem", max_age_ms=50),
+        }
+    },
+)
+bound_executor = GuardedExecutor(ArmourGate(bound_policy))
+bound_executor.register_bound(
+    "read_note",
+    lambda _proposal, context: context.capability("resource").read_text(),
+    {"resource": FilesystemBinder()},
+)
+```
+
+The binding is single-use and scoped to one proposal fingerprint, policy
+fingerprint, and execution ID. Path substitution after preparation cannot
+redirect the open descriptor. This binds resource identity only: deadlines and
+state/version checks remain necessary for mutable contents or authorization.
+See [the execution-binding design](docs/EXECUTION_BINDING.md) for the exact
+guarantee, invariants, and current non-goals. Network and API binders are not
+implemented.
+
 Raw model JSON should enter through `ActionProposal.from_untrusted(...)`. Human approval is represented by a signed `HumanApproval` bound to one exact proposal and policy version. Unsigned approvals are never trusted. The host—not the model—must create approvals through a separate trusted interaction.
 
 For separated deployments, the approval service holds the Ed25519 private key:

@@ -39,16 +39,21 @@ Policy construction fails if any allowed action lacks a human-owned effect class
 - an execution-started receipt written before an authorized handler runs
 - completion-receipt failure reported separately from handler success, without
   discarding a successful handler result
+- for policy-bound filesystem reads, path replacement after preparation cannot
+  redirect the already-open descriptor supplied to the registered handler
 
 ## Explicit non-goals and residual risks
 
 - Armour is not an operating-system, container, process, or bytecode sandbox.
 - Registered handlers are trusted and can violate policy if incorrectly written.
-- A path can change between verification and ordinary path-based handler access.
-  On supported POSIX platforms Armour provides `open_beneath()` and
-  `read_text_beneath()` to walk from a trusted directory descriptor and reject
-  symlinks at every component. Handlers performing other filesystem operations
-  must use equivalent directory-relative, no-follow controls.
+- Ordinary path-based handlers can still reopen a changed path. On supported
+  POSIX platforms, filesystem execution binding can instead supply a live,
+  no-follow descriptor for the verified resource identity. That guarantee
+  holds only when the registered handler uses the supplied capability; it does
+  not freeze same-inode contents or authorization. Other filesystem operations
+  require equivalent host implementations.
+- Execution binding is currently process-local and filesystem-read-only. It has
+  no network, DNS, API, database, credential, or cross-process binder.
 - A hostname can resolve differently between verification and connection; network handlers must pin or re-verify the actual connected address.
 - Development mode falls back to a process-local approval ledger. Production mode requires durable replay storage.
 - `SQLiteApprovalLedger` coordinates processes sharing one database file; separate hosts require a host-provided atomic `ApprovalLedger` implementation.
