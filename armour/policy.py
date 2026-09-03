@@ -9,6 +9,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Mapping
 
+from .binding import DependencyPolicy
 from .models import Effect, Risk
 from .schemas import ActionSchema
 
@@ -18,6 +19,9 @@ class Policy:
     allowed_actions: frozenset[str]
     action_effects: Mapping[str, Effect] = field(default_factory=dict)
     action_schemas: Mapping[str, ActionSchema] = field(default_factory=dict)
+    action_dependencies: Mapping[str, Mapping[str, DependencyPolicy]] = field(
+        default_factory=dict
+    )
     allowed_roots: tuple[Path, ...] = field(default_factory=tuple)
     allowed_http_methods: frozenset[str] = frozenset({"GET", "HEAD"})
     human_gate_at: Risk = Risk.HIGH
@@ -58,6 +62,10 @@ class Policy:
         )
         effects = dict(self.action_effects)
         schemas = dict(self.action_schemas)
+        dependencies = {
+            action: dict(action_dependencies)
+            for action, action_dependencies in self.action_dependencies.items()
+        }
         if any(action not in self.allowed_actions for action in effects):
             raise ValueError("action_effects may only describe allowed actions")
         missing_effects = self.allowed_actions.difference(effects)
@@ -72,12 +80,34 @@ class Policy:
             raise ValueError("action_schemas may only describe allowed actions")
         if any(not isinstance(schema, ActionSchema) for schema in schemas.values()):
             raise TypeError("action_schemas values must be ActionSchema members")
+        if any(action not in actions for action in dependencies):
+            raise ValueError("action_dependencies may only describe allowed actions")
+        for action, action_dependencies in dependencies.items():
+            if not action_dependencies:
+                raise ValueError(f"action dependencies may not be empty: {action!r}")
+            if any(not isinstance(name, str) or not name for name in action_dependencies):
+                raise TypeError("dependency names must be non-empty strings")
+            if any(
+                not isinstance(dependency, DependencyPolicy)
+                for dependency in action_dependencies.values()
+            ):
+                raise TypeError("action dependency values must be DependencyPolicy members")
         if not isinstance(self.policy_id, str) or not self.policy_id:
             raise TypeError("policy_id must be a non-empty string")
         if not isinstance(self.revision, int) or isinstance(self.revision, bool) or self.revision < 1:
             raise ValueError("policy_id must be non-empty and revision must be positive")
         object.__setattr__(self, "action_effects", MappingProxyType(effects))
         object.__setattr__(self, "action_schemas", MappingProxyType(schemas))
+        object.__setattr__(
+            self,
+            "action_dependencies",
+            MappingProxyType(
+                {
+                    action: MappingProxyType(action_dependencies)
+                    for action, action_dependencies in dependencies.items()
+                }
+            ),
+        )
         object.__setattr__(self, "_construction_fingerprint", self._compute_fingerprint())
 
     def _compute_fingerprint(self) -> str:
@@ -92,6 +122,15 @@ class Policy:
                 "action_schemas": {
                     key: value.to_dict()
                     for key, value in sorted(self.action_schemas.items())
+                },
+                "action_dependencies": {
+                    action: {
+                        name: dependency.to_dict()
+                        for name, dependency in sorted(action_dependencies.items())
+                    }
+                    for action, action_dependencies in sorted(
+                        self.action_dependencies.items()
+                    )
                 },
                 "allowed_roots": sorted(str(path) for path in self.allowed_roots),
                 "allowed_http_methods": sorted(self.allowed_http_methods),
