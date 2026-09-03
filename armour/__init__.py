@@ -7,7 +7,18 @@ from .approvals import (
     HMACApprovalVerifier,
 )
 from .audit import ReceiptIntegrityError, ReceiptLog, ReceiptVerification
+from .binding import (
+    BindingConsumed,
+    BindingError,
+    BindingExpired,
+    BindingMismatch,
+    DependencyPolicy,
+    ExecutionBinding,
+    ExecutionContext,
+    prepare_execution_binding,
+)
 from .executor import GuardedExecutor
+from .filesystem_binding import BoundFile, FilesystemBinder
 from .evaluation import (
     Mutation,
     MutationOutcome,
@@ -47,12 +58,21 @@ __all__ = [
     "ApprovalLedgerError",
     "ArmourGate",
     "AuditStatus",
+    "BindingConsumed",
+    "BindingError",
+    "BindingExpired",
+    "BindingMismatch",
+    "BoundFile",
     "Decision",
     "Ed25519ApprovalSigner",
     "Ed25519ApprovalVerifier",
     "Effect",
+    "DependencyPolicy",
+    "ExecutionBinding",
+    "ExecutionContext",
     "ExecutionOutcome",
     "GuardedExecutor",
+    "FilesystemBinder",
     "HumanApproval",
     "HMACApprovalVerifier",
     "InMemoryApprovalLedger",
@@ -70,6 +90,7 @@ __all__ = [
     "UnsafePathError",
     "Verdict",
     "open_beneath",
+    "prepare_execution_binding",
     "read_text_beneath",
     "standard_mutant_family",
 ]

@@ -109,6 +109,7 @@ class ReceiptLog:
                     "output": _sanitize(outcome.output),
                     "error": outcome.error,
                     "execution_id": outcome.execution_id,
+                    "binding_id": outcome.binding_id,
                     "audit_status": outcome.audit_status.value,
                     "audit_error": outcome.audit_error,
                 },

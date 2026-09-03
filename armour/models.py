@@ -250,5 +250,6 @@ class ExecutionOutcome:
     output: Any = None
     error: str | None = None
     execution_id: str | None = None
+    binding_id: str | None = None
     audit_status: AuditStatus = AuditStatus.NOT_CONFIGURED
     audit_error: str | None = None
