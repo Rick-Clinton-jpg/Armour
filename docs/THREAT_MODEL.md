@@ -41,6 +41,8 @@ Policy construction fails if any allowed action lacks a human-owned effect class
   discarding a successful handler result
 - for policy-bound filesystem reads, path replacement after preparation cannot
   redirect the already-open descriptor supplied to the registered handler
+- when the optional remembering gate is used, repeated rejections can only
+  tighten policy by quarantining the same host-authenticated subject
 
 ## Explicit non-goals and residual risks
 
@@ -54,6 +56,12 @@ Policy construction fails if any allowed action lacks a human-owned effect class
   require equivalent host implementations.
 - Execution binding is currently process-local and filesystem-read-only. It has
   no network, DNS, API, database, credential, or cross-process binder.
+- Security memory depends on a trustworthy subject identity. An agent allowed
+  to choose that identity can evade quarantine or frame another subject.
+- Incident memory is behavioral evidence, not truth. Permanent mutant cases
+  require explicit trusted-reviewer promotion to limit memory poisoning.
+- Security-memory SQLite files coordinate one host and need protection from
+  deletion, rollback, corruption, and disk exhaustion.
 - A hostname can resolve differently between verification and connection; network handlers must pin or re-verify the actual connected address.
 - Development mode falls back to a process-local approval ledger. Production mode requires durable replay storage.
 - `SQLiteApprovalLedger` coordinates processes sharing one database file; separate hosts require a host-provided atomic `ApprovalLedger` implementation.

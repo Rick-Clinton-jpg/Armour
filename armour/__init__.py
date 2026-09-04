@@ -19,6 +19,7 @@ from .binding import (
 )
 from .executor import GuardedExecutor
 from .filesystem_binding import BoundFile, FilesystemBinder
+from .memory_sandbox import RememberingGate, SecurityMemorySandbox
 from .evaluation import (
     Mutation,
     MutationOutcome,
@@ -48,6 +49,15 @@ from .models import (
 from .policy import Policy
 from .safe_filesystem import UnsafePathError, open_beneath, read_text_beneath
 from .schemas import ActionSchema
+from .security_memory import (
+    IncidentRecord,
+    RememberedMutant,
+    RememberedMutantOutcome,
+    RememberedMutantReport,
+    SecurityMemoryError,
+    SQLiteIncidentMemory,
+    SQLiteMutantMemory,
+)
 
 __all__ = [
     "ActionProposal",
@@ -76,6 +86,7 @@ __all__ = [
     "HumanApproval",
     "HMACApprovalVerifier",
     "InMemoryApprovalLedger",
+    "IncidentRecord",
     "Mutation",
     "MutationOutcome",
     "MutationReport",
@@ -84,8 +95,16 @@ __all__ = [
     "ReceiptLog",
     "ReceiptIntegrityError",
     "ReceiptVerification",
+    "RememberedMutant",
+    "RememberedMutantOutcome",
+    "RememberedMutantReport",
+    "RememberingGate",
     "Risk",
     "SQLiteApprovalLedger",
+    "SQLiteIncidentMemory",
+    "SQLiteMutantMemory",
+    "SecurityMemoryError",
+    "SecurityMemorySandbox",
     "STANDARD_INVARIANTS",
     "UnsafePathError",
     "Verdict",

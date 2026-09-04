@@ -151,6 +151,22 @@ See [the execution-binding design](docs/EXECUTION_BINDING.md) for the exact
 guarantee, invariants, and current non-goals. Network and API binders are not
 implemented.
 
+### Security memory sandbox (experimental)
+
+Armour can optionally test two forms of durable memory without allowing either
+one to rewrite its base policy:
+
+- Incident memory records rejected behavior under a host-authenticated subject
+  identity and can quarantine that subject after a configured number of recent
+  rejections.
+- Mutant memory stores only reviewer-promoted, data-only proposals and replays
+  them against later policies to expose regressions.
+
+This is an offline policy-evaluation sandbox, not process or operating-system
+containment. Runtime observations never promote themselves into permanent
+tests. See [the security-memory design](docs/SECURITY_MEMORY.md) for its trust
+boundary and limitations.
+
 Raw model JSON should enter through `ActionProposal.from_untrusted(...)`. Human approval is represented by a signed `HumanApproval` bound to one exact proposal and policy version. Unsigned approvals are never trusted. The host—not the model—must create approvals through a separate trusted interaction.
 
 For separated deployments, the approval service holds the Ed25519 private key:
