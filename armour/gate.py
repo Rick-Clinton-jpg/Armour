@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
-from datetime import datetime, timezone
+from collections.abc import Callable, Iterable
+from datetime import datetime, timedelta, timezone
 import logging
 
 from .approvals import ApprovalVerifier
@@ -11,7 +11,16 @@ from .ledger import (
     ApprovalLedger,
     InMemoryApprovalLedger,
 )
-from .models import ActionProposal, CheckResult, Decision, HumanApproval, Risk, Verdict
+from .limits import bounded_positive_finite
+from .models import (
+    MAX_APPROVAL_LIFETIME_SECONDS,
+    ActionProposal,
+    CheckResult,
+    Decision,
+    HumanApproval,
+    Risk,
+    Verdict,
+)
 from .policy import Policy
 from .verifiers import (
     ActionVerifier,
@@ -24,6 +33,11 @@ from .verifiers import (
 
 
 logger = logging.getLogger(__name__)
+MAX_APPROVAL_FUTURE_SKEW_SECONDS = 30
+
+
+def _system_utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 class ArmourGate:
@@ -36,6 +50,8 @@ class ArmourGate:
         approval_verifier: ApprovalVerifier | None = None,
         approval_ledger: ApprovalLedger | None = None,
         production_mode: bool = False,
+        approval_clock: Callable[[], datetime] = _system_utc_now,
+        max_approval_lifetime_seconds: float = MAX_APPROVAL_LIFETIME_SECONDS,
     ):
         self.policy = policy
         self.approval_verifier = approval_verifier
@@ -47,6 +63,16 @@ class ArmourGate:
         if not isinstance(getattr(self.approval_ledger, "durable", None), bool):
             raise TypeError("approval ledger must declare whether it is durable")
         self.production_mode = production_mode
+        if not callable(approval_clock):
+            raise TypeError("approval_clock must be callable")
+        self._approval_clock = approval_clock
+        self._max_approval_lifetime_seconds = float(
+            bounded_positive_finite(
+                max_approval_lifetime_seconds,
+                name="maximum approval lifetime seconds",
+                hard_max=MAX_APPROVAL_LIFETIME_SECONDS,
+            )
+        )
         if production_mode and approval_verifier is None:
             raise ValueError("production mode requires a trusted approval verifier")
         if production_mode and not self.approval_ledger.durable:
@@ -63,6 +89,15 @@ class ArmourGate:
         ):
             raise ValueError(
                 "production mode requires an integrity-protected approval ledger"
+            )
+        missing_schemas = self.policy.allowed_actions.difference(
+            self.policy.action_schemas
+        )
+        if production_mode and missing_schemas:
+            missing = ", ".join(sorted(missing_schemas))
+            raise ValueError(
+                "production mode requires a strict action schema for every "
+                f"allowed action; missing: {missing}"
             )
         if approval_verifier is not None and not self.approval_ledger.durable:
             logger.warning(
@@ -99,7 +134,11 @@ class ArmourGate:
         )
 
     def security_report(self) -> dict[str, object]:
-        """Describe the protections actually active for this gate."""
+        """Describe active protections for trusted administrators only.
+
+        Host applications must not expose this configuration inventory to an
+        untrusted model, proposal, remote caller, or ordinary application log.
+        """
         weaknesses: list[str] = []
         if self.approval_verifier is None:
             weaknesses.append("trusted approval verifier is not configured")
@@ -113,6 +152,11 @@ class ArmourGate:
             self.approval_ledger, "integrity_protected", False
         ):
             weaknesses.append("durable approval ledger is not authenticated")
+        missing_schemas = self.policy.allowed_actions.difference(
+            self.policy.action_schemas
+        )
+        if missing_schemas:
+            weaknesses.append("one or more allowed actions lack a strict schema")
         return {
             "production_mode": self.production_mode,
             "approval_verification": self.approval_verifier is not None,
@@ -126,6 +170,7 @@ class ArmourGate:
             "approval_ledger_integrity": bool(
                 getattr(self.approval_ledger, "integrity_protected", False)
             ),
+            "strict_action_schemas": not missing_schemas,
             "weaknesses": tuple(weaknesses),
         }
 
@@ -267,6 +312,8 @@ class ArmourGate:
                 approval.approved_by,
                 approval.expires_at,
                 approval.nonce,
+                approval.reason,
+                approval.timestamp,
                 approval.key_id,
                 approval.signature,
             )
@@ -276,10 +323,30 @@ class ArmourGate:
             expires = datetime.fromisoformat(approval.expires_at)
             if expires.tzinfo is None:
                 return False, "approval expiry must include a timezone"
+            issued = datetime.fromisoformat(approval.timestamp)
+            if issued.tzinfo is None:
+                return False, "approval timestamp must include a timezone"
         except (TypeError, ValueError):
-            return False, "approval expiry is invalid"
-        if expires <= datetime.now(timezone.utc):
+            return False, "approval timing is invalid"
+        expires = expires.astimezone(timezone.utc)
+        issued = issued.astimezone(timezone.utc)
+        try:
+            now = self._approval_clock()
+            if not isinstance(now, datetime) or now.tzinfo is None:
+                raise TypeError("approval clock returned an invalid time")
+            now = now.astimezone(timezone.utc)
+        except Exception:
+            logger.exception("trusted approval clock failed closed")
+            return False, "trusted approval clock unavailable"
+        if expires <= now:
             return False, "approval has expired"
+        lifetime_seconds = (expires - issued).total_seconds()
+        if lifetime_seconds <= 0:
+            return False, "approval expiry must follow its timestamp"
+        if lifetime_seconds > self._max_approval_lifetime_seconds:
+            return False, "approval lifetime exceeds configured maximum"
+        if issued > now + timedelta(seconds=MAX_APPROVAL_FUTURE_SKEW_SECONDS):
+            return False, "approval timestamp is in the future"
         if not approval.approved_by.strip() or not approval.nonce:
             return False, "approval identity or nonce is missing"
         if self.approval_verifier is None:

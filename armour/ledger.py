@@ -14,7 +14,12 @@ from threading import Lock
 import time
 from typing import Iterator, Protocol
 
+from .limits import bounded_positive_int
 from .models import HumanApproval
+
+
+MAX_APPROVAL_LEDGER_CLAIMS = 100_000
+DEFAULT_APPROVAL_LEDGER_CLAIMS = 10_000
 
 
 class ApprovalLedgerError(RuntimeError):
@@ -96,6 +101,7 @@ class SQLiteApprovalLedger:
         integrity_key: bytes | None = None,
         checkpoint: ApprovalCheckpoint | None = None,
         trust_existing_claims: bool = False,
+        max_claims: int = DEFAULT_APPROVAL_LEDGER_CLAIMS,
     ) -> None:
         if not isinstance(deployment_namespace, str) or not deployment_namespace.strip():
             raise ValueError("deployment_namespace must be a non-empty string")
@@ -113,6 +119,11 @@ class SQLiteApprovalLedger:
         self._integrity_key = integrity_key
         self._checkpoint = checkpoint
         self._trust_existing_claims = bool(trust_existing_claims)
+        self.max_claims = bounded_positive_int(
+            max_claims,
+            name="approval ledger max_claims",
+            hard_max=MAX_APPROVAL_LEDGER_CLAIMS,
+        )
         self.integrity_protected = integrity_key is not None
         self._initialize()
         self._initialize_integrity()
@@ -386,6 +397,28 @@ class SQLiteApprovalLedger:
             with self._connection() as connection:
                 connection.execute("BEGIN IMMEDIATE")
                 generation = self._verify_integrity(connection)
+                claim_count = connection.execute(
+                    """
+                    SELECT COUNT(*) FROM approval_claims
+                    WHERE deployment_namespace = ?
+                    """,
+                    (self.deployment_namespace,),
+                ).fetchone()[0]
+                if claim_count >= self.max_claims:
+                    replay = connection.execute(
+                        """
+                        SELECT 1 FROM approval_claims
+                        WHERE deployment_namespace = ? AND nonce = ?
+                        """,
+                        (self.deployment_namespace, approval.nonce),
+                    ).fetchone()
+                    connection.rollback()
+                    self._advance_checkpoint(generation)
+                    if replay is not None:
+                        return False
+                    raise ApprovalLedgerError(
+                        "approval ledger claim capacity reached"
+                    )
                 try:
                     connection.execute(
                         """

@@ -27,8 +27,10 @@ Policy construction fails if any allowed action lacks a human-owned effect class
 - absolute paths resolving outside explicit roots
 - relative paths at the trust boundary
 - unknown, missing, or nested payload fields for actions with a strict `ActionSchema`
+- production construction when any allowed action lacks a strict `ActionSchema`
 - non-GET/HEAD requests by default
 - literal and DNS-resolved non-public network destinations
+- HTTPS binders configured without certificate verification or hostname checking
 - selected dangerous command signatures
 - approval use against changed proposal arguments
 - approval use against a changed policy
@@ -51,10 +53,26 @@ Policy construction fails if any allowed action lacks a human-owned effect class
   cannot redirect that request and redirects are not followed
 - when the optional remembering gate is used, repeated rejections can only
   tighten policy by quarantining the same host-authenticated subject
+- when the experimental Mirror Loop is explicitly used, rejected or escalated
+  proposal attempts are treated only as inert text inside a proposal-, policy-,
+  and execution-bound state machine with fixed time, step, repetition, and byte
+  ceilings; mismatches and exhausted limits terminate it fail closed
 
 ## Explicit non-goals and residual risks
 
 - Armour is not an operating-system, container, process, or bytecode sandbox.
+- Mirror Loop does not change that fact. Its current implementation contains no
+  real terminal, interpreter, filesystem, network, handler, or subprocess. A
+  deployment that presents a believable terminal must separately isolate the
+  process, remove credentials and capabilities, and deny egress. Its simulated
+  loop can be recognized or ignored by a model; containment must never depend on
+  deception succeeding.
+- Mirror Loop's host configuration can only tighten its absolute ceilings. Its
+  control-escaped reflection exposes printable, visibly escaped text, but that
+  text remains attacker controlled and can still carry HTML, log, or semantic
+  prompt injection. Calling code must apply sink-specific escaping and must not
+  decode or execute it. Its in-process clock is part of the trusted computing
+  base until an external watchdog exists.
 - Registered handlers are trusted and can violate policy if incorrectly written.
 - Ordinary path-based handlers can still reopen a changed path. On supported
   POSIX platforms, filesystem execution binding can instead supply a live,
@@ -66,6 +84,8 @@ Policy construction fails if any allowed action lacks a human-owned effect class
 - Execution binding is process-local and supports read-only filesystem access
   plus fixed HTTP(S) GET/HEAD requests. It has no general API, database,
   credential, state-changing network, or cross-process binder.
+- Execution-binding freshness is capped at 60 seconds. Hosts can configure a
+  shorter deadline but cannot enlarge it beyond that ceiling.
 - Security memory depends on a trustworthy subject identity. An agent allowed
   to choose that identity can evade quarantine or frame another subject.
 - Incident memory is behavioral evidence, not truth. Permanent mutant cases
@@ -83,14 +103,17 @@ Policy construction fails if any allowed action lacks a human-owned effect class
   redirects, and state-changing HTTP methods are outside this binder. The
   maximum-age check prevents a stale request from starting but does not cancel
   an in-flight request; the socket timeout remains a separate host setting.
-  The default SSL context verifies HTTPS certificates and hostnames, but Armour
-  currently accepts host-supplied contexts that disable those checks. Network
-  tests use controlled connections; a live end-to-end HTTPS integration test is
-  not present yet.
+  Both default and custom SSL contexts must retain certificate verification and
+  hostname checking; Armour rechecks mutable contexts immediately before
+  preparation. This does not provide certificate pinning or protect a host that
+  changes the trust store or replaces the trusted process. Network tests use
+  controlled connections; a live end-to-end HTTPS integration test is not
+  present yet.
 - Development mode falls back to a process-local approval ledger. Production mode requires durable replay storage.
 - Production construction fails immediately when the approval verifier is
   absent, the ledger is not durable, signing authority is not declared isolated
-  from the evaluator, or ledger integrity protection is not active. The
+  from the evaluator, ledger integrity protection is not active, or any allowed
+  action lacks a strict host-owned schema. The
   reference production pairing is Ed25519 verification with a keyed durable
   ledger; equivalent host implementations must uphold the same contract.
 - `SQLiteApprovalLedger` coordinates processes sharing one database file and
@@ -106,7 +129,27 @@ Policy construction fails if any allowed action lacks a human-owned effect class
 - Approval-ledger integrity-key rotation is not implemented. Sealing a legacy
   ledger requires an explicit one-time trust decision and cannot establish that
   the old contents were clean before sealing.
-- Pattern scanning cannot establish semantic safety and is only defense in depth.
+- Approval envelopes have a hard one-hour signed-lifetime ceiling, may be
+  limited further by the gate, and reject issuance timestamps more than 30
+  seconds ahead of the configured trusted UTC clock. These checks do not make
+  a compromised wall clock trustworthy: rollback to a time still inside a
+  signed interval can make an approval appear current. High-assurance hosts
+  need externally protected time or a monotonic cross-restart anchor.
+- Integrity-protected approval claims are fully rehashed on each operation.
+  The reference ledger therefore fails closed at a bounded per-namespace
+  capacity (10,000 by default, never above 100,000) instead of growing without
+  limit. This bounds, but does not remove, the O(n) cost and can intentionally
+  halt new approvals when capacity is reached. Operators must monitor capacity;
+  Armour never discards nonce history automatically because unsafe retention
+  could restore replay attacks.
+- Pattern scanning cannot establish semantic safety and is only defense in
+  depth. Production schemas reject undeclared payload structure, but they do
+  not make an allowed string semantically safe. Trusted handlers must never
+  execute model-controlled text as code.
+- `security_report()` is a trusted-administrator diagnostic. Host applications
+  that expose or log it to an untrusted layer disclose their configured control
+  posture; Armour does not provide an authentication service around local
+  method calls.
 - Armour does not protect information already sent to a cloud model.
 - It authenticates configured approval keys, not the real-world identity behind them; it does not sign policies, manage credentials, or enforce resource quotas yet.
 - Hash chaining alone detects accidental or unrechained record modification;

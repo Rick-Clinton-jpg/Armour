@@ -36,7 +36,7 @@ Untrusted agent/model
         ├─ effect/risk floor
         ├─ filesystem confinement
         ├─ public read-only network policy
-        └─ dangerous-content rejection
+        └─ selected dangerous-content signatures (advisory)
         │
         ├─ REJECTED
         ├─ ESCALATED ── explicit human approval
@@ -120,6 +120,28 @@ outcome = executor.execute(proposal)
   effect solely because its audit record is incomplete.
 
 Armour is a policy boundary, not a complete sandbox. Host handlers remain trusted code and must avoid time-of-check/time-of-use mistakes. Bound read-only handlers can use `FilesystemBinder` for an already-open no-follow file or `NetworkBinder` for one fixed GET/HEAD request over an already-connected verified public peer. These guarantees apply only when the handler uses the supplied capability; other operations still require equivalently safe host implementations.
+
+### Mirror Loop (experimental)
+
+The optional Mirror Loop prototype accepts attempts from an already rejected or
+escalated proposal as inert text, reflects that text through a bounded state
+machine, and produces hash-only evidence for trusted review. Active terminal
+and Unicode controls become visible tokens in a typed, still-untrusted
+reflection value. Sessions are bound
+to one proposal, policy, and execution ID and terminate on scope mismatch,
+expiry, repetition, step, or byte limits. It never executes the reflected text
+and does not automatically teach security memory.
+
+Mirror Loop is not a shell sandbox and must not be placed in front of a real
+terminal without separate process or virtual-machine isolation, credential
+removal, and deny-by-default egress. See [the exact experimental guarantee and
+non-goals](docs/MIRROR_LOOP.md).
+
+Execution-binding dependency age has an absolute 60-second freshness ceiling;
+host policy may only make it shorter. Mirror Loop similarly has non-negotiable
+outer ceilings documented in its design. Armour's evidence labels and the gate
+for independent review are defined in
+[the verification protocol](docs/VERIFICATION_PROTOCOL.md).
 
 ### Filesystem execution binding (experimental)
 
@@ -218,10 +240,11 @@ gate = ArmourGate.production(
 decision = gate.evaluate(proposal, approval=approval)
 ```
 
-Production construction rejects the configuration unless all four conditions
+Production construction rejects the configuration unless all five conditions
 are true: a trusted approval verifier is present, the approval ledger is
 durable, the verifier declares isolated signing authority, and the ledger
-declares integrity protection. `Ed25519ApprovalVerifier` plus a keyed
+declares integrity protection, and every allowed action has a strict
+host-owned `ActionSchema`. `Ed25519ApprovalVerifier` plus a keyed
 `SQLiteApprovalLedger` is the reference configuration; an equivalent custom
 implementation must provide the same declared properties and behaviour.
 
@@ -230,6 +253,18 @@ implementation must provide the same declared properties and behaviour.
 The integrity key must be at least 32 bytes, remain outside SQLite, and remain stable across restarts. An existing unsealed ledger is rejected by default. After independently validating that legacy database, an operator may open it once with `trust_existing_claims=True` to seal its current contents. This cannot prove the ledger was untampered before sealing. Automatic ledger-integrity-key rotation is not implemented.
 
 Valid approvals are consumed by `evaluate()` by default, including when a caller uses the gate directly. `consume_approval=False` is an explicit preview mode; its result must never be treated as execution authority.
+
+Signed approvals have a non-negotiable one-hour lifetime ceiling, and a gate
+may configure a shorter maximum. The signed issuance timestamp must precede
+expiry, and timestamps more than 30 seconds ahead of the gate's trusted clock
+are rejected. `approval_clock` can be connected to a host-owned trustworthy
+UTC time source. This bounds approval envelopes but does not make the local
+clock rollback-proof; high-assurance deployments still need externally
+protected time or a monotonic cross-restart anchor.
+
+`security_report()` is an administrator-only diagnostic. Do not expose its
+configuration inventory to an agent, proposal, remote caller, or ordinary
+application log.
 
 ## Mutation testing and coverage
 
@@ -248,7 +283,7 @@ assert report.passed
 print(report.to_dict())
 ```
 
-The standard family tests proposal-policy attacks plus production-construction violations, approval-ledger tampering and rollback, network-binding substitution, and security-memory integrity, quarantine, and review controls. It combines ordinary gate-evaluated proposal mutants with offline boundary probes for constructors, ledgers, memory, and binders. These probes never invoke `GuardedExecutor` or a registered handler. Applications should still add domain-specific mutants for their own tools and policies.
+The standard family tests proposal-policy attacks plus production-construction violations, approval-ledger tampering and rollback, network-binding substitution, execution-binding freshness, security-memory integrity, quarantine and review controls, and Mirror Loop authorization, scope, hard ceilings, input types, display safety, and resource limits. It combines ordinary gate-evaluated proposal mutants with offline boundary probes for constructors, ledgers, memory, binders, and bounded deception. These probes never invoke `GuardedExecutor` or a registered handler. Applications should still add domain-specific mutants for their own tools and policies.
 
 Mutation evaluation never executes a proposal through a registered handler. A
 mutant is “killed” when its gate evaluation or boundary probe produces one of
@@ -258,6 +293,10 @@ the report.
 ## Status
 
 Early-stage research prototype and active work in progress. Policy integrity checks, HMAC and Ed25519 approval binding, durable atomic approval replay protection, staged receipt chains, explicit execution/audit outcomes, and the offline mutation harness are implemented and covered by the test suite. These tests are evidence about the cases exercised, not a security certification. Armour is not recommended for production or security-critical use at this stage; evaluation and use are entirely at the user's own risk.
+
+Current verification snapshot: 174 unit tests pass and all 31 modeled mutants
+are killed with full modeled-invariant coverage. This is self-adversarial test
+evidence, not an independent human security audit or proof of general safety.
 
 ## Files
 
@@ -289,8 +328,8 @@ Early-stage research prototype and active work in progress. Policy integrity che
   own I/O.
 - Filesystem binding does not freeze contents of an opened inode or prevent
   access through hard-link aliases.
-- `NetworkBinder` uses a certificate-verifying TLS context by default, but a
-  host-supplied insecure `ssl.SSLContext` can weaken HTTPS authentication.
+- `NetworkBinder` requires certificate verification and hostname checking at
+  construction and rechecks its mutable TLS context before preparation.
 - Network binding has controlled socket tests but no live HTTPS integration
   test yet.
 - HMAC approval verification does not isolate signing authority from the evaluator and is rejected by production construction; use Ed25519 or an equivalent verifier that keeps signing authority outside the evaluator.
@@ -298,8 +337,17 @@ Early-stage research prototype and active work in progress. Policy integrity che
 - Development mode uses process-local replay protection unless `SQLiteApprovalLedger` is supplied; production mode refuses that fallback.
 - SQLite protects concurrent processes sharing one database file, not hosts that do not share an atomic store.
 - Direct replay-ledger edits fail closed when the production integrity key remains secret. Detecting replacement by an older valid ledger additionally requires a monotonic `ApprovalCheckpoint` outside SQLite's rollback boundary.
-- Approval-ledger integrity currently hashes all claims in the deployment namespace on each operation. This is bounded by operational control rather than an implemented claim-retention limit and requires performance testing for large ledgers.
-- Pattern scanning is defense in depth, not semantic proof.
+- Approval-ledger integrity currently hashes all claims in the deployment
+  namespace on each operation. Growth is now fail-closed at 10,000 claims by
+  default (configurable only up to a hard 100,000 ceiling), but performance
+  still requires testing before choosing a deployment limit. Armour does not
+  automatically delete replay history.
+- Pattern scanning is defense in depth, not semantic proof. Production mode
+  requires a strict schema for every action, and registered handlers must
+  never execute model-controlled text as shell, SQL, Python, or other code.
+- Approval expiry depends on the configured trusted UTC clock. The signed
+  lifetime and future-timestamp limits reduce exposure but do not defeat a
+  compromised clock that remains inside the signed validity interval.
 - Armour cannot protect information already sent to a cloud model.
 - Receipt hash chaining cannot prevent deletion or a complete attacker-rehashed
   rewrite. Optional checkpoints detect primary-log loss or replacement only if

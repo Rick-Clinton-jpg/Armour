@@ -282,6 +282,24 @@ class ApprovalLedgerTests(unittest.TestCase):
                 self.database, integrity_key=b"different-key-material".ljust(32, b"!")
             )
 
+    def test_integrity_protected_ledger_has_a_hard_capacity(self):
+        ledger = SQLiteApprovalLedger(
+            self.database,
+            integrity_key=self.integrity_key,
+            max_claims=1,
+        )
+        self.assertTrue(ledger.claim(self.approval))
+        self.assertFalse(ledger.claim(self.approval))
+        second = replace(self.approval, nonce="second-capacity-test-nonce")
+        with self.assertRaisesRegex(ApprovalLedgerError, "capacity"):
+            ledger.claim(second)
+
+        with self.assertRaisesRegex(ValueError, "at most"):
+            SQLiteApprovalLedger(
+                Path(self.temp.name) / "excessive-capacity.sqlite3",
+                max_claims=100_001,
+            )
+
     def test_existing_claims_require_explicit_one_time_sealing(self):
         legacy = SQLiteApprovalLedger(self.database)
         self.assertTrue(legacy.claim(self.approval))

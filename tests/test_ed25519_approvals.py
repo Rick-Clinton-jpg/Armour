@@ -8,6 +8,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from armour import (
     ActionProposal,
+    ActionSchema,
     ArmourGate,
     Ed25519ApprovalSigner,
     Ed25519ApprovalVerifier,
@@ -34,6 +35,7 @@ class Ed25519ApprovalTests(unittest.TestCase):
         self.policy = Policy(
             allowed_actions=frozenset({"delete"}),
             action_effects={"delete": Effect.DESTRUCTIVE},
+            action_schemas={"delete": ActionSchema(frozenset())},
             policy_id="public-key-test",
         )
         self.proposal = ActionProposal("delete", Effect.DESTRUCTIVE, Risk.HIGH)
@@ -146,6 +148,22 @@ class Ed25519ApprovalTests(unittest.TestCase):
                 approval_ledger=SQLiteApprovalLedger(
                     Path(self.temp.name) / "unprotected-approvals.sqlite3"
                 ),
+            )
+
+    def test_production_requires_strict_schema_for_every_action(self):
+        policy = Policy(
+            allowed_actions=frozenset({"delete"}),
+            action_effects={"delete": Effect.DESTRUCTIVE},
+        )
+        ledger = SQLiteApprovalLedger(
+            Path(self.temp.name) / "schema-required.sqlite3",
+            integrity_key=b"schema-required-integrity-key!!!",
+        )
+        with self.assertRaisesRegex(ValueError, "strict action schema"):
+            ArmourGate.production(
+                policy,
+                approval_verifier=self.verifier,
+                approval_ledger=ledger,
             )
 
 

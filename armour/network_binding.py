@@ -20,6 +20,14 @@ _SAFE_METHODS = frozenset({"GET", "HEAD"})
 _DEFAULT_PORTS = {"http": 80, "https": 443}
 
 
+def _secure_tls_context(context: object) -> bool:
+    return (
+        isinstance(context, ssl.SSLContext)
+        and context.verify_mode == ssl.CERT_REQUIRED
+        and context.check_hostname is True
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class NetworkResponse:
     """Bound response data returned without exposing the underlying socket."""
@@ -41,6 +49,11 @@ def _open_pinned_connection(
     ssl_context: ssl.SSLContext,
 ) -> http.client.HTTPConnection:
     """Connect to the selected numeric address without another DNS lookup."""
+
+    if not _secure_tls_context(ssl_context):
+        raise BindingError(
+            "HTTPS requires certificate verification and hostname checking"
+        )
 
     raw_socket = socket.create_connection((destination_ip, port), timeout=timeout)
     connected_socket: socket.socket | ssl.SSLSocket = raw_socket
@@ -180,7 +193,12 @@ class NetworkBinder:
         self._resolver = resolver
         self._timeout = float(timeout)
         self._max_response_bytes = max_response_bytes
-        self._ssl_context = ssl_context or ssl.create_default_context()
+        candidate_context = ssl_context or ssl.create_default_context()
+        if not _secure_tls_context(candidate_context):
+            raise ValueError(
+                "HTTPS requires certificate verification and hostname checking"
+            )
+        self._ssl_context = candidate_context
         self.last_capability: BoundNetworkConnection | None = None
 
     def _open_connection(
@@ -205,6 +223,12 @@ class NetworkBinder:
     def prepare(
         self, request: BindingRequest, *, monotonic_ns: Callable[[], int]
     ) -> BoundNetworkConnection:
+        # SSLContext is mutable. Recheck it at use time so a context weakened
+        # after construction cannot silently disable HTTPS authentication.
+        if not _secure_tls_context(self._ssl_context):
+            raise BindingError(
+                "HTTPS requires certificate verification and hostname checking"
+            )
         proposal = request.proposal
         url = (
             proposal.resource

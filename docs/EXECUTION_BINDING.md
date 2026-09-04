@@ -95,12 +95,12 @@ extracts the URL and method from the proposal, checks them against the
 host-owned network policy, resolves the hostname exactly once, and rejects the
 entire result if any returned address is private, loopback, link-local,
 reserved, or otherwise non-public. It then opens a socket directly to one
-verified numeric address. HTTPS still verifies the certificate against the
-original hostname when the default certificate-verifying SSL context is used,
-and sends that hostname through normal HTTP handling. A host may supply a
-custom `ssl.SSLContext`; Armour does not currently reject a context that
-disables certificate or hostname verification, so that configuration can
-weaken HTTPS authentication.
+verified numeric address. HTTPS verifies the certificate against the original
+hostname and sends that hostname through normal HTTP handling. A custom
+`ssl.SSLContext` is accepted only when `CERT_REQUIRED` and hostname checking
+are active. Because contexts are mutable, Armour checks those properties both
+at binder construction and immediately before preparation; weakening the
+context in between fails closed before a connection is opened.
 
 The handler receives `BoundNetworkConnection`, not a URL or a cached DNS
 verdict. Its `request()` method takes no destination, method, headers, or body,

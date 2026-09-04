@@ -1,4 +1,5 @@
 import unittest
+import ssl
 from dataclasses import replace
 from unittest.mock import patch
 
@@ -178,6 +179,26 @@ class NetworkBindingTests(unittest.TestCase):
                 proposal = replace(self.proposal, method=method)
                 with self.assertRaisesRegex(BindingError, "method"):
                     self.prepare(proposal=proposal)
+        self.assertEqual(self.connections, [])
+
+    def test_insecure_tls_context_is_rejected_at_construction(self):
+        context = ssl._create_unverified_context()
+        with self.assertRaisesRegex(ValueError, "certificate verification"):
+            NetworkBinder(ssl_context=context)
+
+    def test_tls_context_weakened_after_construction_fails_closed(self):
+        context = ssl.create_default_context()
+        binder = NetworkBinder(resolver=self.resolver, ssl_context=context)
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        with self.assertRaisesRegex(BindingError, "certificate verification"):
+            prepare_execution_binding(
+                self.proposal,
+                self.policy,
+                execution_id="exec-1",
+                binders={"network": binder},
+                monotonic_ns=self.clock,
+            )
         self.assertEqual(self.connections, [])
 
     def test_invalid_port_and_url_credentials_fail_before_connection(self):
