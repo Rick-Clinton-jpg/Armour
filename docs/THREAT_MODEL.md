@@ -60,8 +60,11 @@ Policy construction fails if any allowed action lacks a human-owned effect class
   to choose that identity can evade quarantine or frame another subject.
 - Incident memory is behavioral evidence, not truth. Permanent mutant cases
   require explicit trusted-reviewer promotion to limit memory poisoning.
-- Security-memory SQLite files coordinate one host and need protection from
-  deletion, rollback, corruption, and disk exhaustion.
+- Security-memory records are authenticated with a host-held key; direct row
+  edits, insertions, and deletions fail closed. Detecting replacement by an
+  older valid database additionally requires a host-provided monotonic
+  checkpoint outside SQLite's rollback boundary. Key secrecy, identity,
+  checkpoint durability, and disk exhaustion remain host responsibilities.
 - A hostname can resolve differently between verification and connection; network handlers must pin or re-verify the actual connected address.
 - Development mode falls back to a process-local approval ledger. Production mode requires durable replay storage.
 - `SQLiteApprovalLedger` coordinates processes sharing one database file; separate hosts require a host-provided atomic `ApprovalLedger` implementation.

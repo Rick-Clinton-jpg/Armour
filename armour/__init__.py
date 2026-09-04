@@ -51,6 +51,7 @@ from .safe_filesystem import UnsafePathError, open_beneath, read_text_beneath
 from .schemas import ActionSchema
 from .security_memory import (
     IncidentRecord,
+    MemoryCheckpoint,
     RememberedMutant,
     RememberedMutantOutcome,
     RememberedMutantReport,
@@ -87,6 +88,7 @@ __all__ = [
     "HMACApprovalVerifier",
     "InMemoryApprovalLedger",
     "IncidentRecord",
+    "MemoryCheckpoint",
     "Mutation",
     "MutationOutcome",
     "MutationReport",

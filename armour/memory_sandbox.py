@@ -38,6 +38,10 @@ class RememberingGate:
             raise ValueError("window_seconds must be positive")
         if not incident_memory.durable:
             raise ValueError("remembering gate requires durable incident memory")
+        if not getattr(incident_memory, "integrity_protected", False):
+            raise ValueError(
+                "remembering gate requires integrity-protected incident memory"
+            )
         retained = getattr(incident_memory, "max_records_per_subject", None)
         if isinstance(retained, int) and rejection_threshold > retained:
             raise ValueError(
@@ -102,6 +106,10 @@ class SecurityMemorySandbox:
     """Offline harness joining incident observation and reviewed mutant memory."""
 
     def __init__(self, gate: RememberingGate, mutant_memory: SQLiteMutantMemory):
+        if not mutant_memory.integrity_protected:
+            raise ValueError(
+                "security memory sandbox requires integrity-protected mutant memory"
+            )
         self.gate = gate
         self.mutant_memory = mutant_memory
 

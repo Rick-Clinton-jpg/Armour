@@ -162,6 +162,11 @@ one to rewrite its base policy:
 - Mutant memory stores only reviewer-promoted, data-only proposals and replays
   them against later policies to expose regressions.
 
+Both operational wrappers require a host-held integrity key. Direct SQLite row
+tampering then fails closed. A host-provided monotonic checkpoint can also
+detect replacement with an older valid database; keeping that checkpoint in
+the same rollback boundary as SQLite does not add this protection.
+
 This is an offline policy-evaluation sandbox, not process or operating-system
 containment. Runtime observations never promote themselves into permanent
 tests. See [the security-memory design](docs/SECURITY_MEMORY.md) for its trust

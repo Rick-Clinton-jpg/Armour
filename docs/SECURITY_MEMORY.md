@@ -5,6 +5,43 @@ Status: experimental, offline policy-evaluation feature.
 This sandbox tests two deliberately separate memories. It is not an operating-
 system, container, or process sandbox and it never executes registered handlers.
 
+## Integrity protection
+
+The remembering gate and combined sandbox require a host-supplied
+`integrity_key` of at least 32 bytes. Armour authenticates the complete current
+contents and generation of each memory namespace with HMAC-SHA-256 before it
+uses the records. Inserting, editing, or deleting a row directly in SQLite—or
+opening the database with the wrong key—therefore fails closed with
+`SecurityMemoryError`.
+
+```python
+incident_memory = SQLiteIncidentMemory(
+    "armour-memory.sqlite3",
+    integrity_key=load_32_byte_key_from_secret_manager(),
+)
+mutant_memory = SQLiteMutantMemory(
+    "armour-memory.sqlite3",
+    integrity_key=load_32_byte_key_from_secret_manager(),
+)
+```
+
+The key must remain outside the database and remain stable across restarts.
+Armour does not store, derive, rotate, or recover this key.
+
+A valid older database contains a valid older authenticator, so a key alone
+cannot reveal that the entire file was rolled back. For rollback detection, the
+host can also supply a `MemoryCheckpoint` whose generation is stored in a
+separate monotonic trust boundary. If its generation is ahead of SQLite, Armour
+fails closed. The checkpoint implementation must atomically retain the maximum
+generation it receives; another ordinary file beside the database is not an
+independent rollback boundary.
+
+Existing unsealed records are not authenticated automatically. The first
+keyed opening fails unless the operator explicitly sets
+`trust_existing_records=True` after independently validating the old database.
+That one-time action seals the current contents; it cannot prove they were
+untampered before sealing.
+
 ## Incident memory
 
 `SQLiteIncidentMemory` durably records rejected proposals under a host-supplied
@@ -47,7 +84,13 @@ judgment. Promotion therefore records the reviewer and source incident.
   eventually consistent across concurrent processes, not a global atomic lock.
 - Identity authentication belongs to the host integration.
 - SQLite coordinates processes on one host, not a distributed fleet.
-- Database rollback, deletion, or disk exhaustion requires host protection.
+- Row insertion, editing, and deletion are detected only while the integrity
+  key remains secret. Full-file rollback/deletion requires a trustworthy
+  external `MemoryCheckpoint` to distinguish old valid state from fresh state.
+- Integrity verification hashes the namespace contents and is currently O(n)
+  per memory operation; the configured capacity bounds that work.
+- Integrity-key rotation and recovery are not implemented yet.
+- Disk exhaustion still requires host monitoring and capacity planning.
 - Remembered mutants preserve proposals, not complete external-world state.
 - The sandbox does not repair execution-binding limitations such as mutable
   same-inode contents, hard-link aliases, or trusted handlers that ignore a

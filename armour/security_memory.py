@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
@@ -21,6 +23,20 @@ from .models import ActionProposal, Decision, Effect, Risk, Verdict
 
 class SecurityMemoryError(RuntimeError):
     """Durable security memory could not be read or updated safely."""
+
+
+class MemoryCheckpoint(Protocol):
+    """Host-owned monotonic state used to detect valid database rollback.
+
+    ``advance_generation`` must atomically retain the maximum generation it has
+    seen. Receiving an older generation is a successful no-op, never a rewind.
+    """
+
+    def read_generation(self, component: str, namespace: str) -> int | None: ...
+
+    def advance_generation(
+        self, component: str, namespace: str, generation: int
+    ) -> None: ...
 
 
 def _positive_limit(name: str, value: int) -> int:
@@ -98,15 +114,28 @@ class _SQLiteMemory:
         deployment_namespace: str = "default",
         timeout_seconds: float = 5.0,
         wall_clock: Callable[[], float] = time.time,
+        integrity_key: bytes | None = None,
+        checkpoint: MemoryCheckpoint | None = None,
+        trust_existing_records: bool = False,
     ):
         if not isinstance(deployment_namespace, str) or not deployment_namespace.strip():
             raise ValueError("deployment_namespace must be a non-empty string")
         if timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
+        if integrity_key is not None and (
+            not isinstance(integrity_key, bytes) or len(integrity_key) < 32
+        ):
+            raise ValueError("integrity_key must contain at least 32 bytes")
+        if checkpoint is not None and integrity_key is None:
+            raise ValueError("checkpoint requires an integrity_key")
         self.path = Path(path).expanduser().resolve()
         self.deployment_namespace = deployment_namespace
         self.timeout_seconds = timeout_seconds
         self._wall_clock = wall_clock
+        self._integrity_key = integrity_key
+        self._checkpoint = checkpoint
+        self._trust_existing_records = bool(trust_existing_records)
+        self.integrity_protected = integrity_key is not None
         self._prepare_file()
 
     def _prepare_file(self) -> None:
@@ -157,6 +186,18 @@ class _SQLiteMemory:
                     )
                     """
                 )
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS security_memory_integrity (
+                        component TEXT NOT NULL,
+                        deployment_namespace TEXT NOT NULL,
+                        generation INTEGER NOT NULL,
+                        content_digest TEXT NOT NULL,
+                        authenticator TEXT NOT NULL,
+                        PRIMARY KEY (component, deployment_namespace)
+                    )
+                    """
+                )
                 row = connection.execute(
                     "SELECT version FROM armour_schema WHERE component = ?", (component,)
                 ).fetchone()
@@ -178,9 +219,216 @@ class _SQLiteMemory:
         except sqlite3.Error as exc:
             raise SecurityMemoryError("security memory initialization failed") from exc
 
+    def _integrity_payload(
+        self, component: str, generation: int, content_digest: str
+    ) -> bytes:
+        return json.dumps(
+            {
+                "component": component,
+                "deployment_namespace": self.deployment_namespace,
+                "generation": generation,
+                "content_digest": content_digest,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode()
+
+    def _content_digest(
+        self,
+        connection: sqlite3.Connection,
+        table: str,
+        columns: tuple[str, ...],
+    ) -> str:
+        selected = ", ".join(columns)
+        rows = connection.execute(
+            f"SELECT {selected} FROM {table} "
+            "WHERE deployment_namespace = ? ORDER BY id",
+            (self.deployment_namespace,),
+        ).fetchall()
+        try:
+            canonical = json.dumps(
+                rows, separators=(",", ":"), allow_nan=False
+            ).encode()
+        except (TypeError, ValueError) as exc:
+            raise SecurityMemoryError(
+                "security memory contains non-canonical data"
+            ) from exc
+        return hashlib.sha256(canonical).hexdigest()
+
+    def _authenticator(
+        self, component: str, generation: int, content_digest: str
+    ) -> str:
+        assert self._integrity_key is not None
+        return hmac.new(
+            self._integrity_key,
+            self._integrity_payload(component, generation, content_digest),
+            hashlib.sha256,
+        ).hexdigest()
+
+    def _check_external_generation(self, component: str, generation: int) -> None:
+        if self._checkpoint is None:
+            return
+        try:
+            anchored = self._checkpoint.read_generation(
+                component, self.deployment_namespace
+            )
+            if anchored is not None and (
+                not isinstance(anchored, int)
+                or isinstance(anchored, bool)
+                or anchored < 0
+            ):
+                raise SecurityMemoryError("security memory checkpoint is invalid")
+            if anchored is not None and anchored > generation:
+                raise SecurityMemoryError("security memory rollback detected")
+            if anchored is None or anchored < generation:
+                self._checkpoint.advance_generation(
+                    component, self.deployment_namespace, generation
+                )
+        except SecurityMemoryError:
+            raise
+        except Exception as exc:
+            raise SecurityMemoryError("security memory checkpoint unavailable") from exc
+
+    def _assert_external_not_ahead(self, component: str, generation: int) -> None:
+        if self._checkpoint is None:
+            return
+        try:
+            anchored = self._checkpoint.read_generation(
+                component, self.deployment_namespace
+            )
+            if anchored is not None and (
+                not isinstance(anchored, int)
+                or isinstance(anchored, bool)
+                or anchored < 0
+            ):
+                raise SecurityMemoryError("security memory checkpoint is invalid")
+            if anchored is not None and anchored > generation:
+                raise SecurityMemoryError("security memory rollback detected")
+        except SecurityMemoryError:
+            raise
+        except Exception as exc:
+            raise SecurityMemoryError("security memory checkpoint unavailable") from exc
+
+    def _verify_integrity(
+        self,
+        connection: sqlite3.Connection,
+        component: str,
+        table: str,
+        columns: tuple[str, ...],
+    ) -> int:
+        if self._integrity_key is None:
+            return 0
+        content_digest = self._content_digest(connection, table, columns)
+        row = connection.execute(
+            """
+            SELECT generation, content_digest, authenticator
+            FROM security_memory_integrity
+            WHERE component = ? AND deployment_namespace = ?
+            """,
+            (component, self.deployment_namespace),
+        ).fetchone()
+        if row is None:
+            count = connection.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE deployment_namespace = ?",
+                (self.deployment_namespace,),
+            ).fetchone()[0]
+            if count and not self._trust_existing_records:
+                raise SecurityMemoryError(
+                    "existing security memory is unsealed; explicit trust is required"
+                )
+            generation = 0
+            authenticator = self._authenticator(
+                component, generation, content_digest
+            )
+            connection.execute(
+                """
+                INSERT INTO security_memory_integrity (
+                    component, deployment_namespace, generation,
+                    content_digest, authenticator
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    component, self.deployment_namespace, generation,
+                    content_digest, authenticator,
+                ),
+            )
+        else:
+            generation, stored_digest, stored_authenticator = row
+            if (
+                not isinstance(generation, int)
+                or isinstance(generation, bool)
+                or generation < 0
+                or not isinstance(stored_digest, str)
+                or not isinstance(stored_authenticator, str)
+            ):
+                raise SecurityMemoryError("security memory integrity state is invalid")
+            expected = self._authenticator(component, generation, stored_digest)
+            if (
+                not hmac.compare_digest(stored_digest, content_digest)
+                or not hmac.compare_digest(stored_authenticator, expected)
+            ):
+                raise SecurityMemoryError("security memory integrity check failed")
+        self._assert_external_not_ahead(component, generation)
+        return generation
+
+    def _reseal_integrity(
+        self,
+        connection: sqlite3.Connection,
+        component: str,
+        table: str,
+        columns: tuple[str, ...],
+        previous_generation: int,
+    ) -> int:
+        if self._integrity_key is None:
+            return 0
+        generation = previous_generation + 1
+        content_digest = self._content_digest(connection, table, columns)
+        authenticator = self._authenticator(component, generation, content_digest)
+        connection.execute(
+            """
+            UPDATE security_memory_integrity
+            SET generation = ?, content_digest = ?, authenticator = ?
+            WHERE component = ? AND deployment_namespace = ?
+            """,
+            (
+                generation, content_digest, authenticator,
+                component, self.deployment_namespace,
+            ),
+        )
+        return generation
+
+    def _initialize_integrity(
+        self, component: str, table: str, columns: tuple[str, ...]
+    ) -> None:
+        if self._integrity_key is None:
+            return
+        try:
+            with self._connection() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                generation = self._verify_integrity(
+                    connection, component, table, columns
+                )
+                connection.commit()
+        except SecurityMemoryError:
+            raise
+        except (sqlite3.Error, TypeError, ValueError) as exc:
+            raise SecurityMemoryError("security memory integrity unavailable") from exc
+        self._check_external_generation(component, generation)
+        # This authorizes exactly one constructor-time import of legacy rows.
+        # It must never permit a later missing seal to bless altered contents.
+        self._trust_existing_records = False
+
 
 class SQLiteIncidentMemory(_SQLiteMemory):
     """Durable rejected-behavior history scoped by trusted subject identity."""
+
+    _component = "incident_memory"
+    _table = "security_incidents"
+    _integrity_columns = (
+        "id", "deployment_namespace", "subject_id", "proposal_fingerprint",
+        "policy_fingerprint", "action", "families_json", "recorded_at",
+    )
 
     def __init__(
         self,
@@ -200,7 +448,7 @@ class SQLiteIncidentMemory(_SQLiteMemory):
         self.max_records_total = max_records_total
         super().__init__(path, **kwargs)
         self._initialize_component(
-            "incident_memory",
+            self._component,
             """
             CREATE TABLE IF NOT EXISTS security_incidents (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -213,6 +461,9 @@ class SQLiteIncidentMemory(_SQLiteMemory):
                 recorded_at REAL NOT NULL
             )
             """,
+        )
+        self._initialize_integrity(
+            self._component, self._table, self._integrity_columns
         )
 
     @staticmethod
@@ -238,6 +489,10 @@ class SQLiteIncidentMemory(_SQLiteMemory):
         try:
             with self._connection() as connection:
                 connection.execute("BEGIN IMMEDIATE")
+                generation = self._verify_integrity(
+                    connection, self._component, self._table,
+                    self._integrity_columns,
+                )
                 cursor = connection.execute(
                     """
                     INSERT INTO security_incidents (
@@ -279,10 +534,15 @@ class SQLiteIncidentMemory(_SQLiteMemory):
                 ).fetchone()[0]
                 if total > self.max_records_total:
                     raise SecurityMemoryError("incident memory capacity reached")
+                new_generation = self._reseal_integrity(
+                    connection, self._component, self._table,
+                    self._integrity_columns, generation,
+                )
                 connection.commit()
                 incident_id = int(cursor.lastrowid)
         except sqlite3.Error as exc:
             raise SecurityMemoryError("incident memory is unavailable") from exc
+        self._check_external_generation(self._component, new_generation)
         return IncidentRecord(
             incident_id, self.deployment_namespace, subject_id,
             proposal.fingerprint(), decision.policy_fingerprint,
@@ -293,6 +553,13 @@ class SQLiteIncidentMemory(_SQLiteMemory):
         subject_id = self._validate_subject(subject_id)
         try:
             with self._connection() as connection:
+                # Serialize the verified snapshot with writers so a concurrent
+                # legitimate generation cannot look like database rollback.
+                connection.execute("BEGIN IMMEDIATE")
+                generation = self._verify_integrity(
+                    connection, self._component, self._table,
+                    self._integrity_columns,
+                )
                 row = connection.execute(
                     """
                     SELECT COUNT(*) FROM security_incidents
@@ -300,6 +567,8 @@ class SQLiteIncidentMemory(_SQLiteMemory):
                     """,
                     (self.deployment_namespace, subject_id, since),
                 ).fetchone()
+                self._check_external_generation(self._component, generation)
+                connection.commit()
         except sqlite3.Error as exc:
             raise SecurityMemoryError("incident memory is unavailable") from exc
         return int(row[0])
@@ -312,6 +581,11 @@ class SQLiteIncidentMemory(_SQLiteMemory):
             parameters += (self._validate_subject(subject_id),)
         try:
             with self._connection() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                generation = self._verify_integrity(
+                    connection, self._component, self._table,
+                    self._integrity_columns,
+                )
                 rows = connection.execute(
                     f"""SELECT id, deployment_namespace, subject_id,
                                proposal_fingerprint, policy_fingerprint, action,
@@ -319,6 +593,8 @@ class SQLiteIncidentMemory(_SQLiteMemory):
                         FROM security_incidents WHERE {where} ORDER BY id""",
                     parameters,
                 ).fetchall()
+                self._check_external_generation(self._component, generation)
+                connection.commit()
         except sqlite3.Error as exc:
             raise SecurityMemoryError("incident memory is unavailable") from exc
         try:
@@ -337,6 +613,13 @@ class SQLiteMutantMemory(_SQLiteMemory):
     """Human-promoted, data-only regression proposals."""
 
     schema_version = 2
+    _component = "mutant_memory"
+    _table = "remembered_mutants"
+    _integrity_columns = (
+        "id", "deployment_namespace", "name", "proposal_fingerprint",
+        "proposal_json", "expected_verdicts_json", "policy_fingerprint",
+        "promoted_by", "source_incident_id", "created_at",
+    )
 
     def __init__(
         self,
@@ -349,7 +632,7 @@ class SQLiteMutantMemory(_SQLiteMemory):
         super().__init__(path, **kwargs)
         self._migrate_legacy_table()
         self._initialize_component(
-            "mutant_memory",
+            self._component,
             """
             CREATE TABLE IF NOT EXISTS remembered_mutants (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -366,6 +649,9 @@ class SQLiteMutantMemory(_SQLiteMemory):
                 UNIQUE (deployment_namespace, proposal_fingerprint)
             )
             """,
+        )
+        self._initialize_integrity(
+            self._component, self._table, self._integrity_columns
         )
 
     @staticmethod
@@ -482,6 +768,10 @@ class SQLiteMutantMemory(_SQLiteMemory):
         try:
             with self._connection() as connection:
                 connection.execute("BEGIN IMMEDIATE")
+                generation = self._verify_integrity(
+                    connection, self._component, self._table,
+                    self._integrity_columns,
+                )
                 count = connection.execute(
                     """
                     SELECT COUNT(*) FROM remembered_mutants
@@ -505,6 +795,10 @@ class SQLiteMutantMemory(_SQLiteMemory):
                         policy_fingerprint, promoted_by, source_incident_id, created_at,
                     ),
                 )
+                new_generation = self._reseal_integrity(
+                    connection, self._component, self._table,
+                    self._integrity_columns, generation,
+                )
                 connection.commit()
                 mutant_id = int(cursor.lastrowid)
         except sqlite3.IntegrityError as exc:
@@ -513,6 +807,7 @@ class SQLiteMutantMemory(_SQLiteMemory):
             ) from exc
         except sqlite3.Error as exc:
             raise SecurityMemoryError("mutant memory is unavailable") from exc
+        self._check_external_generation(self._component, new_generation)
         return RememberedMutant(
             mutant_id, self.deployment_namespace, name, proposal,
             expected_verdicts, policy_fingerprint, promoted_by,
@@ -522,6 +817,11 @@ class SQLiteMutantMemory(_SQLiteMemory):
     def mutants(self) -> tuple[RememberedMutant, ...]:
         try:
             with self._connection() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                generation = self._verify_integrity(
+                    connection, self._component, self._table,
+                    self._integrity_columns,
+                )
                 rows = connection.execute(
                     """
                     SELECT id, deployment_namespace, name, proposal_json,
@@ -532,6 +832,8 @@ class SQLiteMutantMemory(_SQLiteMemory):
                     """,
                     (self.deployment_namespace,),
                 ).fetchall()
+                self._check_external_generation(self._component, generation)
+                connection.commit()
         except sqlite3.Error as exc:
             raise SecurityMemoryError("mutant memory is unavailable") from exc
         remembered = []

@@ -1,8 +1,10 @@
 import gc
 import json
 import os
+import shutil
 import sqlite3
 import tempfile
+import threading
 import unittest
 import warnings
 from contextlib import closing
@@ -34,6 +36,22 @@ class WallClock:
         self.now += seconds
 
 
+class TrustedCheckpoint:
+    def __init__(self):
+        self.generations = {}
+        self.lock = threading.Lock()
+
+    def read_generation(self, component, namespace):
+        with self.lock:
+            return self.generations.get((component, namespace))
+
+    def advance_generation(self, component, namespace, generation):
+        with self.lock:
+            key = (component, namespace)
+            current = self.generations.get(key, -1)
+            self.generations[key] = max(current, generation)
+
+
 class SecurityMemoryTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -48,6 +66,7 @@ class SecurityMemoryTests(unittest.TestCase):
         self.secret.write_text("secret")
         self.db = self.base / "memory.sqlite3"
         self.clock = WallClock()
+        self.integrity_key = b"security-memory-test-key-material!"
         self.policy = Policy(
             allowed_actions=frozenset({"read"}),
             action_effects={"read": Effect.READ_ONLY},
@@ -66,12 +85,14 @@ class SecurityMemoryTests(unittest.TestCase):
 
     def incident_memory(self):
         return SQLiteIncidentMemory(
-            self.db, deployment_namespace="tests", wall_clock=self.clock
+            self.db, deployment_namespace="tests", wall_clock=self.clock,
+            integrity_key=self.integrity_key,
         )
 
     def mutant_memory(self):
         return SQLiteMutantMemory(
-            self.db, deployment_namespace="tests", wall_clock=self.clock
+            self.db, deployment_namespace="tests", wall_clock=self.clock,
+            integrity_key=self.integrity_key,
         )
 
     def remembering_gate(self, threshold=3, window=300):
@@ -270,7 +291,15 @@ class SecurityMemoryTests(unittest.TestCase):
                     ),
                 )
             connection.commit()
-        memory = self.mutant_memory()
+        with self.assertRaisesRegex(SecurityMemoryError, "unsealed"):
+            SQLiteMutantMemory(
+                self.db, deployment_namespace="tests", wall_clock=self.clock,
+                integrity_key=self.integrity_key,
+            )
+        memory = SQLiteMutantMemory(
+            self.db, deployment_namespace="tests", wall_clock=self.clock,
+            integrity_key=self.integrity_key, trust_existing_records=True,
+        )
         self.assertEqual([mutant.name for mutant in memory.mutants()], ["first"])
         with closing(sqlite3.connect(self.db)) as connection:
             version = connection.execute(
@@ -285,6 +314,7 @@ class SecurityMemoryTests(unittest.TestCase):
             wall_clock=self.clock,
             max_records_per_subject=3,
             max_records_total=4,
+            integrity_key=self.integrity_key,
         )
         for index in range(5):
             proposal = ActionProposal(
@@ -305,6 +335,7 @@ class SecurityMemoryTests(unittest.TestCase):
             wall_clock=self.clock,
             max_records_per_subject=2,
             max_records_total=2,
+            integrity_key=self.integrity_key,
         )
         decision = ArmourGate(self.policy).evaluate(self.attack)
         memory.record_rejection("agent-a", self.attack, decision)
@@ -320,7 +351,10 @@ class SecurityMemoryTests(unittest.TestCase):
         self.assertEqual(len(memory.incidents("agent-a")), 2)
 
     def test_incident_rejects_decision_for_different_proposal(self):
-        memory = SQLiteIncidentMemory(self.db, deployment_namespace="mismatch")
+        memory = SQLiteIncidentMemory(
+            self.db, deployment_namespace="mismatch",
+            integrity_key=self.integrity_key,
+        )
         decision = ArmourGate(self.policy).evaluate(self.attack)
         other = ActionProposal(
             "read", Effect.READ_ONLY, Risk.LOW,
@@ -335,6 +369,7 @@ class SecurityMemoryTests(unittest.TestCase):
             deployment_namespace="threshold",
             max_records_per_subject=2,
             max_records_total=10,
+            integrity_key=self.integrity_key,
         )
         with self.assertRaisesRegex(ValueError, "retention"):
             RememberingGate(
@@ -347,6 +382,7 @@ class SecurityMemoryTests(unittest.TestCase):
             deployment_namespace="capacity",
             wall_clock=self.clock,
             max_mutants=2,
+            integrity_key=self.integrity_key,
         )
         for index in range(2):
             memory.remember(
@@ -383,6 +419,125 @@ class SecurityMemoryTests(unittest.TestCase):
         self.assertFalse(
             [item for item in captured if issubclass(item.category, ResourceWarning)]
         )
+
+    def test_incident_row_tampering_fails_closed(self):
+        gate = self.remembering_gate()
+        gate.evaluate(self.attack, subject_id="agent-a")
+        with closing(sqlite3.connect(self.db)) as connection:
+            connection.execute(
+                "UPDATE security_incidents SET subject_id = 'attacker'"
+            )
+            connection.commit()
+        with self.assertRaisesRegex(SecurityMemoryError, "integrity"):
+            gate.evaluate(self.safe_proposal, subject_id="agent-a")
+
+    def test_mutant_row_tampering_fails_closed(self):
+        sandbox = SecurityMemorySandbox(self.remembering_gate(), self.mutant_memory())
+        sandbox.observe("agent-a", self.attack)
+        sandbox.promote("outside-root", self.attack, promoted_by="reviewer")
+        with closing(sqlite3.connect(self.db)) as connection:
+            connection.execute(
+                "UPDATE remembered_mutants SET expected_verdicts_json = '[\"authorized\"]'"
+            )
+            connection.commit()
+        with self.assertRaisesRegex(SecurityMemoryError, "integrity"):
+            sandbox.replay()
+
+    def test_wrong_integrity_key_fails_closed(self):
+        self.remembering_gate().evaluate(self.attack, subject_id="agent-a")
+        with self.assertRaisesRegex(SecurityMemoryError, "integrity"):
+            SQLiteIncidentMemory(
+                self.db, deployment_namespace="tests",
+                integrity_key=b"a-different-32-byte-integrity-key!",
+            )
+
+    def test_deleted_integrity_seal_is_not_silently_recreated(self):
+        memory = self.incident_memory()
+        proposal = ActionProposal(
+            "read", Effect.READ_ONLY, Risk.LOW,
+            resource=str(self.secret), id="sealed-incident",
+        )
+        memory.record_rejection(
+            "agent-a", proposal, ArmourGate(self.policy).evaluate(proposal)
+        )
+        with closing(sqlite3.connect(self.db)) as connection:
+            connection.execute(
+                """
+                DELETE FROM security_memory_integrity
+                WHERE component = 'incident_memory'
+                  AND deployment_namespace = 'tests'
+                """
+            )
+            connection.commit()
+        with self.assertRaisesRegex(SecurityMemoryError, "unsealed"):
+            memory.incidents()
+
+    def test_external_checkpoint_detects_valid_database_rollback(self):
+        checkpoint = TrustedCheckpoint()
+        memory = SQLiteIncidentMemory(
+            self.db, deployment_namespace="anchored", wall_clock=self.clock,
+            integrity_key=self.integrity_key, checkpoint=checkpoint,
+        )
+        first = ActionProposal(
+            "read", Effect.READ_ONLY, Risk.LOW,
+            resource=str(self.secret), id="rollback-first",
+        )
+        memory.record_rejection(
+            "agent-a", first, ArmourGate(self.policy).evaluate(first)
+        )
+        with closing(sqlite3.connect(self.db)) as connection:
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        snapshot = self.base / "valid-old-memory.sqlite3"
+        shutil.copyfile(self.db, snapshot)
+        second = ActionProposal(
+            "read", Effect.READ_ONLY, Risk.LOW,
+            resource=str(self.secret), id="rollback-second",
+        )
+        memory.record_rejection(
+            "agent-a", second, ArmourGate(self.policy).evaluate(second)
+        )
+        with closing(sqlite3.connect(self.db)) as connection:
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        shutil.copyfile(snapshot, self.db)
+        with self.assertRaisesRegex(SecurityMemoryError, "rollback"):
+            SQLiteIncidentMemory(
+                self.db, deployment_namespace="anchored",
+                integrity_key=self.integrity_key, checkpoint=checkpoint,
+            )
+
+    def test_concurrent_writers_keep_checkpoint_monotonic(self):
+        checkpoint = TrustedCheckpoint()
+        memory = SQLiteIncidentMemory(
+            self.db, deployment_namespace="concurrent-anchor",
+            integrity_key=self.integrity_key, checkpoint=checkpoint,
+        )
+        decision = ArmourGate(self.policy).evaluate(self.attack)
+        errors = []
+
+        def write_incident():
+            try:
+                memory.record_rejection("agent-a", self.attack, decision)
+            except Exception as exc:  # captured for assertion across the thread
+                errors.append(exc)
+
+        threads = [threading.Thread(target=write_incident) for _ in range(16)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(errors, [])
+        self.assertEqual(memory.rejection_count("agent-a", since=0), 16)
+        self.assertEqual(
+            checkpoint.read_generation("incident_memory", "concurrent-anchor"),
+            16,
+        )
+
+    def test_remembering_gate_rejects_unprotected_memory(self):
+        memory = SQLiteIncidentMemory(
+            self.db, deployment_namespace="unprotected"
+        )
+        with self.assertRaisesRegex(ValueError, "integrity-protected"):
+            RememberingGate(ArmourGate(self.policy), memory)
 
 
 if __name__ == "__main__":
