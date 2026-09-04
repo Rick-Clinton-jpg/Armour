@@ -103,11 +103,15 @@ outcome = executor.execute(proposal)
 - Every allowed action requires a policy-owned effect classification; missing metadata is a policy construction error.
 - Risk is the maximum of request risk, proposal risk, and verifier-inferred risk. A model cannot lower it.
 - Irreversible effects are forbidden by default.
-- High-risk actions require separately supplied human approval.
+- By default, `human_gate_at=Risk.HIGH`, so high-risk actions require separately
+  supplied human approval; the host can configure a different threshold.
 - Approvals bind to the proposal ID, exact arguments, policy fingerprint, approving identity, expiry, and a single-use nonce.
 - Filesystem paths must be absolute and remain beneath explicit roots after resolution.
 - Optional `ActionSchema` contracts reject unknown payload keys and identify the exact filesystem fields shared by verification and the registered handler.
-- Network destinations are restricted to GET/HEAD and checked after DNS resolution for private, loopback, link-local, reserved, and otherwise non-public addresses.
+- The default network policy permits GET/HEAD and rejects private, loopback,
+  link-local, reserved, and otherwise non-public addresses after DNS resolution.
+  These `Policy` settings are host-configurable; the read-only `NetworkBinder`
+  remains limited to GET/HEAD and public resolved addresses.
 - Execution is limited to host-registered Python callables; proposals cannot contain executable handlers.
 - Every decision and outcome can be written to a hash-chained JSONL receipt log.
 - Handler success and audit success are reported separately. If a completion
@@ -115,7 +119,7 @@ outcome = executor.execute(proposal)
   and reports `audit_status="completion_failed"`; callers must not retry the
   effect solely because its audit record is incomplete.
 
-Armour is a policy boundary, not a complete sandbox. Host handlers remain trusted code and must avoid time-of-check/time-of-use mistakes—for example, re-resolve network destinations at connection time. For supported POSIX platforms, `read_text_beneath()` and `open_beneath()` provide directory-relative, no-follow filesystem access so a handler does not reopen a previously verified path by name. Other filesystem operations still require equivalently safe host implementations.
+Armour is a policy boundary, not a complete sandbox. Host handlers remain trusted code and must avoid time-of-check/time-of-use mistakes. Bound read-only handlers can use `FilesystemBinder` for an already-open no-follow file or `NetworkBinder` for one fixed GET/HEAD request over an already-connected verified public peer. These guarantees apply only when the handler uses the supplied capability; other operations still require equivalently safe host implementations.
 
 ### Filesystem execution binding (experimental)
 
@@ -148,8 +152,30 @@ fingerprint, and execution ID. Path substitution after preparation cannot
 redirect the open descriptor. This binds resource identity only: deadlines and
 state/version checks remain necessary for mutable contents or authorization.
 See [the execution-binding design](docs/EXECUTION_BINDING.md) for the exact
-guarantee, invariants, and current non-goals. Network and API binders are not
-implemented.
+guarantee, invariants, and current non-goals. A read-only HTTP(S)
+`NetworkBinder` is implemented; general API and state-changing network binders
+are not.
+
+### Security memory sandbox (experimental)
+
+Armour can optionally test two forms of durable memory without allowing either
+one to rewrite its base policy:
+
+- Incident memory records rejected behavior under a host-authenticated subject
+  identity and can quarantine that subject after a configured number of recent
+  rejections.
+- Mutant memory stores only reviewer-promoted, data-only proposals and replays
+  them against later policies to expose regressions.
+
+Both operational wrappers require a host-held integrity key. Direct SQLite row
+tampering then fails closed. A host-provided monotonic checkpoint can also
+detect replacement with an older valid database; keeping that checkpoint in
+the same rollback boundary as SQLite does not add this protection.
+
+This is an offline policy-evaluation sandbox, not process or operating-system
+containment. Runtime observations never promote themselves into permanent
+tests. See [the security-memory design](docs/SECURITY_MEMORY.md) for its trust
+boundary and limitations.
 
 Raw model JSON should enter through `ActionProposal.from_untrusted(...)`. Human approval is represented by a signed `HumanApproval` bound to one exact proposal and policy version. Unsigned approvals are never trusted. The host—not the model—must create approvals through a separate trusted interaction.
 
@@ -181,6 +207,7 @@ approval_verifier = Ed25519ApprovalVerifier(
 approval_ledger = SQLiteApprovalLedger(
     workspace / "armour-approvals.sqlite3",
     deployment_namespace="notes-production",
+    integrity_key=load_32_byte_key_from_secret_manager(),
 )
 gate = ArmourGate.production(
     policy,
@@ -191,7 +218,16 @@ gate = ArmourGate.production(
 decision = gate.evaluate(proposal, approval=approval)
 ```
 
-`Ed25519ApprovalVerifier` supports key rotation by accepting an explicit map of currently trusted public keys; removing a key ID revokes future approvals from it. The dependency-free `HMACApprovalVerifier` remains available for environments where the evaluator is trusted with the shared signing secret. `SQLiteApprovalLedger` atomically consumes approval nonces across process restarts and multiple Armour processes sharing the same database. Policy and key changes do not reset nonce history. Production construction fails closed unless both trusted approval verification and durable replay storage are configured.
+Production construction rejects the configuration unless all four conditions
+are true: a trusted approval verifier is present, the approval ledger is
+durable, the verifier declares isolated signing authority, and the ledger
+declares integrity protection. `Ed25519ApprovalVerifier` plus a keyed
+`SQLiteApprovalLedger` is the reference configuration; an equivalent custom
+implementation must provide the same declared properties and behaviour.
+
+`Ed25519ApprovalVerifier` supports key rotation by accepting an explicit map of currently trusted public keys; removing a key ID revokes future approvals from it. The dependency-free `HMACApprovalVerifier` remains available for development or environments where the evaluator is intentionally trusted with the shared signing secret. `SQLiteApprovalLedger` atomically consumes approval nonces across process restarts and multiple Armour processes sharing the same database. Policy and key changes do not reset nonce history. Production construction fails closed unless signing authority is isolated from the evaluator and replay storage is both durable and authenticated. A host-provided monotonic `ApprovalCheckpoint` is additionally required to detect replacement by an older, valid ledger.
+
+The integrity key must be at least 32 bytes, remain outside SQLite, and remain stable across restarts. An existing unsealed ledger is rejected by default. After independently validating that legacy database, an operator may open it once with `trust_existing_claims=True` to seal its current contents. This cannot prove the ledger was untampered before sealing. Automatic ledger-integrity-key rotation is not implemented.
 
 Valid approvals are consumed by `evaluate()` by default, including when a caller uses the gate directly. `consume_approval=False` is an explicit preview mode; its result must never be treated as execution authority.
 
@@ -212,9 +248,12 @@ assert report.passed
 print(report.to_dict())
 ```
 
-The standard family tests unknown actions, forbidden effects, root escape, private-network access, dangerous command content, request-risk downgrading, and—when configured—a model understating the effect of a destructive action. Applications should add domain-specific mutants for their own tools and policies.
+The standard family tests proposal-policy attacks plus production-construction violations, approval-ledger tampering and rollback, network-binding substitution, and security-memory integrity, quarantine, and review controls. It combines ordinary gate-evaluated proposal mutants with offline boundary probes for constructors, ledgers, memory, and binders. These probes never invoke `GuardedExecutor` or a registered handler. Applications should still add domain-specific mutants for their own tools and policies.
 
-Mutation evaluation never executes a proposal. A mutant is “killed” when the gate produces one of the mutation's expected safe verdicts; surviving mutants and unexercised invariants fail the report.
+Mutation evaluation never executes a proposal through a registered handler. A
+mutant is “killed” when its gate evaluation or boundary probe produces one of
+the expected safe verdicts; surviving mutants and unexercised invariants fail
+the report.
 
 ## Status
 
@@ -232,7 +271,10 @@ Early-stage research prototype and active work in progress. Policy integrity che
 | `armour/gate.py` | Fail-closed verdict aggregation and approval validation |
 | `armour/ledger.py` | Atomic in-memory and durable SQLite approval replay protection |
 | `armour/executor.py` | Registered-handler execution boundary |
-| `armour/audit.py` | Hash-chained JSONL receipts |
+| `armour/binding.py` | Single-use proposal/policy/execution-scoped capability lifecycle |
+| `armour/filesystem_binding.py` | Already-open, no-follow read capability |
+| `armour/network_binding.py` | Preconnected, public-destination GET/HEAD capability |
+| `armour/audit.py` | Hash-chained JSONL receipts and optional local checkpoints |
 | `armour/evaluation.py` | Offline mutant families and invariant coverage |
 | `armour/safe_filesystem.py` | Directory-relative, no-follow file primitives |
 | `docs/THREAT_MODEL.md` | Trusted base, defended cases, and residual risks |
@@ -241,14 +283,31 @@ Early-stage research prototype and active work in progress. Policy integrity che
 
 - Armour is not an operating-system, container, process, or bytecode sandbox.
 - Registered handlers remain trusted code and can violate policy if incorrectly written.
-- Filesystem and DNS checks have time-of-check/time-of-use risks that handlers must address.
-- HMAC approval verification does not isolate signing authority from the evaluator; use the optional Ed25519 signer/verifier when that separation is required.
+- Ordinary filesystem and network handlers retain time-of-check/time-of-use
+  risks. Bound handlers reduce path and DNS substitution only when they use the
+  supplied capability; trusted handlers can bypass binders by performing their
+  own I/O.
+- Filesystem binding does not freeze contents of an opened inode or prevent
+  access through hard-link aliases.
+- `NetworkBinder` uses a certificate-verifying TLS context by default, but a
+  host-supplied insecure `ssl.SSLContext` can weaken HTTPS authentication.
+- Network binding has controlled socket tests but no live HTTPS integration
+  test yet.
+- HMAC approval verification does not isolate signing authority from the evaluator and is rejected by production construction; use Ed25519 or an equivalent verifier that keeps signing authority outside the evaluator.
 - Armour validates configured public keys but does not operate a certificate authority, distribute keys, or automatically expire signing keys.
 - Development mode uses process-local replay protection unless `SQLiteApprovalLedger` is supplied; production mode refuses that fallback.
 - SQLite protects concurrent processes sharing one database file, not hosts that do not share an atomic store.
+- Direct replay-ledger edits fail closed when the production integrity key remains secret. Detecting replacement by an older valid ledger additionally requires a monotonic `ApprovalCheckpoint` outside SQLite's rollback boundary.
+- Approval-ledger integrity currently hashes all claims in the deployment namespace on each operation. This is bounded by operational control rather than an implemented claim-retention limit and requires performance testing for large ledgers.
 - Pattern scanning is defense in depth, not semantic proof.
 - Armour cannot protect information already sent to a cloud model.
-- Receipt hash chaining detects modification but cannot prevent deletion of the entire receipt file.
+- Receipt hash chaining cannot prevent deletion or a complete attacker-rehashed
+  rewrite. Optional checkpoints detect primary-log loss or replacement only if
+  the attacker cannot also alter the checkpoint.
+- Receipt and checkpoint locking is per `ReceiptLog` instance; other instances
+  in the same process and writers in separate processes are not coordinated.
+- A crash after the primary receipt is flushed but before its checkpoint is
+  flushed leaves a detectable mismatch that requires operator recovery.
 - A completion-audit failure is reported separately from handler success. Hosts
   still need idempotent handlers or downstream idempotency keys to recover safely
   from process crashes and ambiguous external effects.

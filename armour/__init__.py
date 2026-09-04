@@ -6,7 +6,12 @@ from .approvals import (
     Ed25519ApprovalVerifier,
     HMACApprovalVerifier,
 )
-from .audit import ReceiptIntegrityError, ReceiptLog, ReceiptVerification
+from .audit import (
+    ReceiptAnchorVerification,
+    ReceiptIntegrityError,
+    ReceiptLog,
+    ReceiptVerification,
+)
 from .binding import (
     BindingConsumed,
     BindingError,
@@ -19,7 +24,11 @@ from .binding import (
 )
 from .executor import GuardedExecutor
 from .filesystem_binding import BoundFile, FilesystemBinder
+from .network_binding import BoundNetworkConnection, NetworkBinder, NetworkResponse
+from .memory_sandbox import RememberingGate, SecurityMemorySandbox
 from .evaluation import (
+    BoundaryMutation,
+    BoundaryProbeResult,
     Mutation,
     MutationOutcome,
     MutationReport,
@@ -30,6 +39,7 @@ from .evaluation import (
 from .gate import ArmourGate
 from .ledger import (
     ApprovalClaim,
+    ApprovalCheckpoint,
     ApprovalLedger,
     ApprovalLedgerError,
     InMemoryApprovalLedger,
@@ -48,12 +58,23 @@ from .models import (
 from .policy import Policy
 from .safe_filesystem import UnsafePathError, open_beneath, read_text_beneath
 from .schemas import ActionSchema
+from .security_memory import (
+    IncidentRecord,
+    MemoryCheckpoint,
+    RememberedMutant,
+    RememberedMutantOutcome,
+    RememberedMutantReport,
+    SecurityMemoryError,
+    SQLiteIncidentMemory,
+    SQLiteMutantMemory,
+)
 
 __all__ = [
     "ActionProposal",
     "ActionSchema",
     "ApprovalVerifier",
     "ApprovalClaim",
+    "ApprovalCheckpoint",
     "ApprovalLedger",
     "ApprovalLedgerError",
     "ArmourGate",
@@ -62,7 +83,10 @@ __all__ = [
     "BindingError",
     "BindingExpired",
     "BindingMismatch",
+    "BoundaryMutation",
+    "BoundaryProbeResult",
     "BoundFile",
+    "BoundNetworkConnection",
     "Decision",
     "Ed25519ApprovalSigner",
     "Ed25519ApprovalVerifier",
@@ -76,16 +100,29 @@ __all__ = [
     "HumanApproval",
     "HMACApprovalVerifier",
     "InMemoryApprovalLedger",
+    "IncidentRecord",
+    "MemoryCheckpoint",
     "Mutation",
     "MutationOutcome",
     "MutationReport",
     "MutationRunner",
+    "NetworkBinder",
+    "NetworkResponse",
     "Policy",
     "ReceiptLog",
+    "ReceiptAnchorVerification",
     "ReceiptIntegrityError",
     "ReceiptVerification",
+    "RememberedMutant",
+    "RememberedMutantOutcome",
+    "RememberedMutantReport",
+    "RememberingGate",
     "Risk",
     "SQLiteApprovalLedger",
+    "SQLiteIncidentMemory",
+    "SQLiteMutantMemory",
+    "SecurityMemoryError",
+    "SecurityMemorySandbox",
     "STANDARD_INVARIANTS",
     "UnsafePathError",
     "Verdict",

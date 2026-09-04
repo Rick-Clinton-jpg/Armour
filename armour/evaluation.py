@@ -1,21 +1,42 @@
 """Offline mutation testing for Armour policies and verifier chains.
 
-This module never executes a proposal. It challenges the gate with bounded,
-named adversarial variants and reports which safety invariants were actually
-exercised and which mutants survived.
+This module never executes a proposal. It challenges the gate and selected
+fail-closed construction/storage/binding boundaries with bounded, named
+adversarial variants, then reports which safety invariants were exercised and
+which mutants survived.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from contextlib import closing
+from dataclasses import dataclass
+from pathlib import Path
+import shutil
+import sqlite3
+import tempfile
 from typing import Callable, Iterable
 
+from .approvals import HMACApprovalVerifier
+from .binding import BindingError, DependencyPolicy, prepare_execution_binding
 from .gate import ArmourGate
-from .models import ActionProposal, Effect, Risk, Verdict
+from .ledger import (
+    ApprovalLedgerError,
+    InMemoryApprovalLedger,
+    SQLiteApprovalLedger,
+)
+from .memory_sandbox import RememberingGate, SecurityMemorySandbox
+from .models import ActionProposal, Effect, HumanApproval, Risk, Verdict
+from .network_binding import NetworkBinder
 from .policy import Policy
+from .security_memory import (
+    SecurityMemoryError,
+    SQLiteIncidentMemory,
+    SQLiteMutantMemory,
+)
 
 
 MutationTransform = Callable[[ActionProposal], ActionProposal]
+BoundaryProbe = Callable[[ArmourGate, ActionProposal], "BoundaryProbeResult"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,6 +49,27 @@ class Mutation:
         {Verdict.REJECTED, Verdict.ESCALATED}
     )
     request_risk: Risk | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class BoundaryProbeResult:
+    """A verdict-shaped result from a non-executing boundary challenge."""
+
+    verdict: Verdict
+    reasons: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class BoundaryMutation:
+    """Offline lifecycle/storage/binding attack that never invokes a handler."""
+
+    id: str
+    description: str
+    invariant: str
+    probe: BoundaryProbe
+    expected_verdicts: frozenset[Verdict] = frozenset(
+        {Verdict.REJECTED, Verdict.ESCALATED}
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,7 +170,7 @@ class MutationRunner:
     def run(
         self,
         baseline: ActionProposal,
-        mutations: Iterable[Mutation],
+        mutations: Iterable[Mutation | BoundaryMutation],
         *,
         request_risk: Risk = Risk.LOW,
     ) -> MutationReport:
@@ -139,21 +181,45 @@ class MutationRunner:
             if mutation.id in seen_ids:
                 raise ValueError(f"duplicate mutation id: {mutation.id!r}")
             seen_ids.add(mutation.id)
-            mutant = mutation.transform(baseline)
-            if not isinstance(mutant, ActionProposal):
-                raise TypeError(f"mutation {mutation.id!r} did not return ActionProposal")
-            decision = self.gate.evaluate(
-                mutant,
-                request_risk=mutation.request_risk or request_risk,
-            )
+            if isinstance(mutation, Mutation):
+                mutant = mutation.transform(baseline)
+                if not isinstance(mutant, ActionProposal):
+                    raise TypeError(
+                        f"mutation {mutation.id!r} did not return ActionProposal"
+                    )
+                decision = self.gate.evaluate(
+                    mutant,
+                    request_risk=mutation.request_risk or request_risk,
+                )
+                verdict = decision.verdict
+                reasons = decision.reasons
+            elif isinstance(mutation, BoundaryMutation):
+                try:
+                    result = mutation.probe(self.gate, baseline)
+                except Exception as exc:
+                    # A broken probe is evidence of nothing. Treat it as a
+                    # survivor instead of accidentally counting an arbitrary
+                    # exception as a successful fail-closed rejection.
+                    result = BoundaryProbeResult(
+                        Verdict.AUTHORIZED,
+                        (f"boundary probe failed unexpectedly: {type(exc).__name__}",),
+                    )
+                if not isinstance(result, BoundaryProbeResult):
+                    raise TypeError(
+                        f"boundary mutation {mutation.id!r} returned an invalid result"
+                    )
+                verdict = result.verdict
+                reasons = result.reasons
+            else:
+                raise TypeError("mutations must be Mutation or BoundaryMutation values")
             outcomes.append(
                 MutationOutcome(
                     mutation_id=mutation.id,
                     invariant=mutation.invariant,
                     description=mutation.description,
-                    verdict=decision.verdict,
-                    killed=decision.verdict in mutation.expected_verdicts,
-                    reasons=decision.reasons,
+                    verdict=verdict,
+                    killed=verdict in mutation.expected_verdicts,
+                    reasons=reasons,
                 )
             )
         return MutationReport(
@@ -172,13 +238,430 @@ STANDARD_INVARIANTS = frozenset(
         "network_policy",
         "dangerous_content",
         "risk_monotonicity",
+        "production_isolated_signing",
+        "production_durable_ledger",
+        "production_ledger_integrity",
+        "approval_ledger_row_integrity",
+        "approval_ledger_nonce_durability",
+        "approval_ledger_rollback_detection",
+        "approval_ledger_key_integrity",
+        "network_destination_binding",
+        "network_public_destination",
+        "network_method_binding",
+        "security_memory_integrity",
+        "security_memory_quarantine",
+        "security_memory_review_gate",
     }
 )
 
 
+def _expected_failure(
+    operation: Callable[[], object],
+    expected: type[Exception] | tuple[type[Exception], ...],
+    reason: str,
+) -> BoundaryProbeResult:
+    """Count only the intended fail-closed exception as a killed mutant."""
+
+    try:
+        operation()
+    except expected:
+        return BoundaryProbeResult(Verdict.REJECTED, (reason,))
+    except Exception as exc:
+        return BoundaryProbeResult(
+            Verdict.AUTHORIZED,
+            (f"unexpected failure did not prove invariant: {type(exc).__name__}",),
+        )
+    return BoundaryProbeResult(
+        Verdict.AUTHORIZED, ("attack was accepted by the challenged boundary",)
+    )
+
+
+class _IsolatedVerifier:
+    signing_authority_isolated = True
+
+    def verify(self, _approval: HumanApproval) -> bool:
+        return False
+
+
+class _DurableLedger:
+    durable = True
+
+    def __init__(self, *, integrity_protected: bool) -> None:
+        self.integrity_protected = integrity_protected
+
+    def claim(self, _approval: HumanApproval) -> bool:
+        return True
+
+
+class _Checkpoint:
+    def __init__(self) -> None:
+        self.generation: int | None = None
+
+    def read_generation(self, _namespace: str) -> int | None:
+        return self.generation
+
+    def advance_generation(self, _namespace: str, generation: int) -> None:
+        current = -1 if self.generation is None else self.generation
+        self.generation = max(current, generation)
+
+
+class _ProbeResponse:
+    status = 200
+    reason = "OK"
+
+    def read(self, _amount: int) -> bytes:
+        return b"probe"
+
+    def getheaders(self) -> list[tuple[str, str]]:
+        return []
+
+
+class _ProbeConnection:
+    def __init__(self, destination_ip: str) -> None:
+        self.destination_ip = destination_ip
+        self.requests: list[tuple[str, str]] = []
+
+    def request(self, method: str, target: str) -> None:
+        self.requests.append((method, target))
+
+    def getresponse(self) -> _ProbeResponse:
+        return _ProbeResponse()
+
+    def close(self) -> None:
+        pass
+
+
+class _ProbeNetworkBinder(NetworkBinder):
+    def __init__(self, **kwargs: object) -> None:
+        super().__init__(**kwargs)
+        self.destinations: list[str] = []
+
+    def _open_connection(
+        self,
+        *,
+        scheme: str,
+        hostname: str,
+        destination_ip: str,
+        port: int,
+    ) -> _ProbeConnection:
+        del scheme, hostname, port
+        self.destinations.append(destination_ip)
+        return _ProbeConnection(destination_ip)
+
+
+def _production_non_isolated_probe(
+    gate: ArmourGate, _baseline: ActionProposal
+) -> BoundaryProbeResult:
+    verifier = HMACApprovalVerifier({"local": b"shared-secret"})
+    return _expected_failure(
+        lambda: ArmourGate.production(
+            gate.policy,
+            approval_verifier=verifier,
+            approval_ledger=_DurableLedger(integrity_protected=True),
+        ),
+        ValueError,
+        "production rejected evaluator-local signing authority",
+    )
+
+
+def _production_non_durable_probe(
+    gate: ArmourGate, _baseline: ActionProposal
+) -> BoundaryProbeResult:
+    return _expected_failure(
+        lambda: ArmourGate.production(
+            gate.policy,
+            approval_verifier=_IsolatedVerifier(),
+            approval_ledger=InMemoryApprovalLedger(),
+        ),
+        ValueError,
+        "production rejected a non-durable approval ledger",
+    )
+
+
+def _production_unprotected_probe(
+    gate: ArmourGate, _baseline: ActionProposal
+) -> BoundaryProbeResult:
+    return _expected_failure(
+        lambda: ArmourGate.production(
+            gate.policy,
+            approval_verifier=_IsolatedVerifier(),
+            approval_ledger=_DurableLedger(integrity_protected=False),
+        ),
+        ValueError,
+        "production rejected a ledger without integrity protection",
+    )
+
+
+def _approval(baseline: ActionProposal, policy: Policy, nonce: str) -> HumanApproval:
+    approval = HumanApproval.issue(
+        baseline,
+        policy_fingerprint=policy.fingerprint(),
+        approved_by="offline-mutation-harness",
+        key_id="probe",
+    )
+    return HumanApproval(
+        proposal_id=approval.proposal_id,
+        proposal_fingerprint=approval.proposal_fingerprint,
+        policy_fingerprint=approval.policy_fingerprint,
+        approved_by=approval.approved_by,
+        expires_at=approval.expires_at,
+        nonce=nonce,
+        key_id=approval.key_id,
+    )
+
+
+def _ledger_row_tamper_probe(
+    gate: ArmourGate, baseline: ActionProposal
+) -> BoundaryProbeResult:
+    def attack() -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ledger.sqlite3"
+            ledger = SQLiteApprovalLedger(path, integrity_key=b"r" * 32)
+            ledger.claim(_approval(baseline, gate.policy, "row-tamper"))
+            with closing(sqlite3.connect(path)) as connection:
+                connection.execute(
+                    "UPDATE approval_claims SET approved_by = 'attacker'"
+                )
+                connection.commit()
+            ledger.claims()
+
+    return _expected_failure(
+        attack, ApprovalLedgerError, "approval ledger detected row tampering"
+    )
+
+
+def _ledger_nonce_deletion_probe(
+    gate: ArmourGate, baseline: ActionProposal
+) -> BoundaryProbeResult:
+    def attack() -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ledger.sqlite3"
+            ledger = SQLiteApprovalLedger(path, integrity_key=b"d" * 32)
+            ledger.claim(_approval(baseline, gate.policy, "deleted-nonce"))
+            with closing(sqlite3.connect(path)) as connection:
+                connection.execute("DELETE FROM approval_claims")
+                connection.commit()
+            ledger.claims()
+
+    return _expected_failure(
+        attack, ApprovalLedgerError, "approval ledger detected nonce deletion"
+    )
+
+
+def _ledger_rollback_probe(
+    gate: ArmourGate, baseline: ActionProposal
+) -> BoundaryProbeResult:
+    def attack() -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ledger.sqlite3"
+            snapshot = Path(directory) / "old.sqlite3"
+            checkpoint = _Checkpoint()
+            ledger = SQLiteApprovalLedger(
+                path, integrity_key=b"b" * 32, checkpoint=checkpoint
+            )
+            ledger.claim(_approval(baseline, gate.policy, "rollback-one"))
+            with closing(sqlite3.connect(path)) as connection:
+                connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            shutil.copyfile(path, snapshot)
+            ledger.claim(_approval(baseline, gate.policy, "rollback-two"))
+            with closing(sqlite3.connect(path)) as connection:
+                connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            shutil.copyfile(snapshot, path)
+            SQLiteApprovalLedger(
+                path, integrity_key=b"b" * 32, checkpoint=checkpoint
+            )
+
+    return _expected_failure(
+        attack, ApprovalLedgerError, "external checkpoint detected ledger rollback"
+    )
+
+
+def _ledger_wrong_key_probe(
+    gate: ArmourGate, baseline: ActionProposal
+) -> BoundaryProbeResult:
+    def attack() -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ledger.sqlite3"
+            ledger = SQLiteApprovalLedger(path, integrity_key=b"k" * 32)
+            ledger.claim(_approval(baseline, gate.policy, "wrong-key"))
+            SQLiteApprovalLedger(path, integrity_key=b"x" * 32)
+
+    return _expected_failure(
+        attack, ApprovalLedgerError, "approval ledger rejected the wrong integrity key"
+    )
+
+
+def _network_policy() -> Policy:
+    return Policy(
+        allowed_actions=frozenset({"fetch"}),
+        action_effects={"fetch": Effect.READ_ONLY},
+        action_dependencies={
+            "fetch": {"network": DependencyPolicy("network", max_age_ms=50)}
+        },
+        policy_id="offline-network-probes",
+    )
+
+
+def _network_destination_substitution_probe(
+    _gate: ArmourGate, _baseline: ActionProposal
+) -> BoundaryProbeResult:
+    addresses = ["93.184.216.34"]
+    policy = _network_policy()
+    proposal = ActionProposal(
+        "fetch", Effect.READ_ONLY, Risk.LOW,
+        resource="https://example.com/data", method="GET",
+    )
+    binder = _ProbeNetworkBinder(resolver=lambda _host: tuple(addresses))
+    binding = prepare_execution_binding(
+        proposal,
+        policy,
+        execution_id="network-probe",
+        binders={"network": binder},
+        monotonic_ns=lambda: 1_000_000_000,
+    )
+    try:
+        addresses[:] = ["1.1.1.1"]
+        context = binding.consume(
+            proposal=proposal,
+            policy_fingerprint=policy.fingerprint(),
+            execution_id="network-probe",
+        )
+        try:
+            response = context.capability("network").request()
+        finally:
+            context.close()
+    finally:
+        binding.close()
+    if response.destination_ip == "93.184.216.34" and binder.destinations == [
+        "93.184.216.34"
+    ]:
+        return BoundaryProbeResult(
+            Verdict.REJECTED,
+            ("post-binding DNS substitution could not redirect the request",),
+        )
+    return BoundaryProbeResult(
+        Verdict.AUTHORIZED, ("post-binding DNS substitution redirected the request",)
+    )
+
+
+def _network_private_probe(
+    _gate: ArmourGate, _baseline: ActionProposal
+) -> BoundaryProbeResult:
+    policy = _network_policy()
+    proposal = ActionProposal(
+        "fetch", Effect.READ_ONLY, Risk.LOW,
+        resource="http://127.0.0.1/private", method="GET",
+    )
+    return _expected_failure(
+        lambda: prepare_execution_binding(
+            proposal,
+            policy,
+            execution_id="private-probe",
+            binders={"network": _ProbeNetworkBinder()},
+            monotonic_ns=lambda: 1_000_000_000,
+        ),
+        BindingError,
+        "network binder rejected a private resolved destination",
+    )
+
+
+def _network_method_probe(
+    _gate: ArmourGate, _baseline: ActionProposal
+) -> BoundaryProbeResult:
+    policy = _network_policy()
+    proposal = ActionProposal(
+        "fetch", Effect.READ_ONLY, Risk.LOW,
+        resource="https://example.com/data", method="POST",
+    )
+    return _expected_failure(
+        lambda: prepare_execution_binding(
+            proposal,
+            policy,
+            execution_id="method-probe",
+            binders={
+                "network": _ProbeNetworkBinder(
+                    resolver=lambda _host: ("93.184.216.34",)
+                )
+            },
+            monotonic_ns=lambda: 1_000_000_000,
+        ),
+        BindingError,
+        "network binder rejected method confusion",
+    )
+
+
+def _memory_integrity_probe(
+    gate: ArmourGate, baseline: ActionProposal
+) -> BoundaryProbeResult:
+    def attack() -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "memory.sqlite3"
+            memory = SQLiteIncidentMemory(path, integrity_key=b"m" * 32)
+            remembering = RememberingGate(gate, memory, rejection_threshold=2)
+            attack_proposal = ActionProposal(
+                f"{baseline.action}_unknown", Effect.READ_ONLY, Risk.LOW
+            )
+            remembering.evaluate(attack_proposal, subject_id="probe-agent")
+            with closing(sqlite3.connect(path)) as connection:
+                connection.execute(
+                    "UPDATE security_incidents SET subject_id = 'attacker'"
+                )
+                connection.commit()
+            remembering.evaluate(baseline, subject_id="probe-agent")
+
+    return _expected_failure(
+        attack, SecurityMemoryError, "security memory detected row tampering"
+    )
+
+
+def _memory_quarantine_probe(
+    gate: ArmourGate, baseline: ActionProposal
+) -> BoundaryProbeResult:
+    with tempfile.TemporaryDirectory() as directory:
+        memory = SQLiteIncidentMemory(
+            Path(directory) / "memory.sqlite3", integrity_key=b"q" * 32
+        )
+        remembering = RememberingGate(gate, memory, rejection_threshold=1)
+        attack = ActionProposal(
+            f"{baseline.action}_unknown", Effect.READ_ONLY, Risk.LOW
+        )
+        remembering.evaluate(attack, subject_id="probe-agent")
+        decision = remembering.evaluate(baseline, subject_id="probe-agent")
+    if decision.verdict is Verdict.REJECTED and any(
+        "quarantined" in reason for reason in decision.reasons
+    ):
+        return BoundaryProbeResult(decision.verdict, decision.reasons)
+    return BoundaryProbeResult(
+        Verdict.AUTHORIZED, ("repeated rejection did not trigger quarantine",)
+    )
+
+
+def _memory_review_gate_probe(
+    gate: ArmourGate, baseline: ActionProposal
+) -> BoundaryProbeResult:
+    def attack() -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "memory.sqlite3"
+            remembering = RememberingGate(
+                gate,
+                SQLiteIncidentMemory(path, integrity_key=b"v" * 32),
+            )
+            sandbox = SecurityMemorySandbox(
+                remembering,
+                SQLiteMutantMemory(path, integrity_key=b"v" * 32),
+            )
+            sandbox.promote(
+                "unobserved", baseline, promoted_by="offline-mutation-harness"
+            )
+
+    return _expected_failure(
+        attack, ValueError, "unobserved proposal could not enter mutant memory"
+    )
+
+
 def standard_mutant_family(
     baseline: ActionProposal, policy: Policy
-) -> tuple[Mutation, ...]:
+) -> tuple[Mutation | BoundaryMutation, ...]:
     """Create a bounded, deterministic family for a representative proposal."""
 
     def changed(**updates) -> ActionProposal:
@@ -260,4 +743,100 @@ def standard_mutant_family(
                 ),
             )
         )
+
+    mutations.extend(
+        (
+            BoundaryMutation(
+                "production-non-isolated-verifier",
+                "attempt production construction with evaluator-local HMAC signing",
+                "production_isolated_signing",
+                _production_non_isolated_probe,
+                frozenset({Verdict.REJECTED}),
+            ),
+            BoundaryMutation(
+                "production-non-durable-ledger",
+                "attempt production construction with process-local replay state",
+                "production_durable_ledger",
+                _production_non_durable_probe,
+                frozenset({Verdict.REJECTED}),
+            ),
+            BoundaryMutation(
+                "production-unprotected-ledger",
+                "attempt production construction without ledger authentication",
+                "production_ledger_integrity",
+                _production_unprotected_probe,
+                frozenset({Verdict.REJECTED}),
+            ),
+            BoundaryMutation(
+                "approval-ledger-row-tamper",
+                "rewrite a claimed approval row behind the integrity seal",
+                "approval_ledger_row_integrity",
+                _ledger_row_tamper_probe,
+                frozenset({Verdict.REJECTED}),
+            ),
+            BoundaryMutation(
+                "approval-ledger-nonce-deletion",
+                "delete consumed nonces from durable replay history",
+                "approval_ledger_nonce_durability",
+                _ledger_nonce_deletion_probe,
+                frozenset({Verdict.REJECTED}),
+            ),
+            BoundaryMutation(
+                "approval-ledger-valid-rollback",
+                "replace the ledger with an older internally valid snapshot",
+                "approval_ledger_rollback_detection",
+                _ledger_rollback_probe,
+                frozenset({Verdict.REJECTED}),
+            ),
+            BoundaryMutation(
+                "approval-ledger-wrong-integrity-key",
+                "open protected replay state with a different integrity key",
+                "approval_ledger_key_integrity",
+                _ledger_wrong_key_probe,
+                frozenset({Verdict.REJECTED}),
+            ),
+            BoundaryMutation(
+                "network-destination-substitution",
+                "change DNS after binding preparation",
+                "network_destination_binding",
+                _network_destination_substitution_probe,
+                frozenset({Verdict.REJECTED}),
+            ),
+            BoundaryMutation(
+                "network-private-destination",
+                "bind a request to a loopback address",
+                "network_public_destination",
+                _network_private_probe,
+                frozenset({Verdict.REJECTED}),
+            ),
+            BoundaryMutation(
+                "network-method-confusion",
+                "present a state-changing method to the read-only binder",
+                "network_method_binding",
+                _network_method_probe,
+                frozenset({Verdict.REJECTED}),
+            ),
+            BoundaryMutation(
+                "security-memory-row-tamper",
+                "rewrite a recorded incident behind its integrity seal",
+                "security_memory_integrity",
+                _memory_integrity_probe,
+                frozenset({Verdict.REJECTED}),
+            ),
+            BoundaryMutation(
+                "security-memory-quarantine-evasion",
+                "retry a safe action after the subject reached quarantine threshold",
+                "security_memory_quarantine",
+                _memory_quarantine_probe,
+                frozenset({Verdict.REJECTED}),
+            ),
+            BoundaryMutation(
+                "security-memory-unreviewed-promotion",
+                "promote a proposal that has no observed rejected incident",
+                "security_memory_review_gate",
+                _memory_review_gate_probe,
+                frozenset({Verdict.REJECTED}),
+            ),
+        )
+    )
     return tuple(mutations)

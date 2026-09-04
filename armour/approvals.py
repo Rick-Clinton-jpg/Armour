@@ -12,6 +12,8 @@ from .models import ActionProposal, HumanApproval
 
 
 class ApprovalVerifier(Protocol):
+    signing_authority_isolated: bool
+
     def verify(self, approval: HumanApproval) -> bool:
         """Return whether the complete approval envelope has trusted provenance."""
 
@@ -22,6 +24,8 @@ class HMACApprovalVerifier:
     Public-key verification should be supplied through ``ApprovalVerifier`` when
     the evaluator must not possess approval-signing authority.
     """
+
+    signing_authority_isolated = False
 
     def __init__(self, trusted_keys: Mapping[str, bytes]):
         keys = dict(trusted_keys)
@@ -66,6 +70,8 @@ def _load_ed25519():
 
 class Ed25519ApprovalVerifier:
     """Verify approvals using public keys held by the Armour evaluator."""
+
+    signing_authority_isolated = True
 
     def __init__(self, trusted_public_keys: Mapping[str, bytes]):
         _, _, _, public_key_type = _load_ed25519()

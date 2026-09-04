@@ -12,6 +12,7 @@ from armour import (
     Ed25519ApprovalSigner,
     Ed25519ApprovalVerifier,
     Effect,
+    InMemoryApprovalLedger,
     Policy,
     Risk,
     SQLiteApprovalLedger,
@@ -118,6 +119,7 @@ class Ed25519ApprovalTests(unittest.TestCase):
         ledger = SQLiteApprovalLedger(
             Path(self.temp.name) / "approvals.sqlite3",
             deployment_namespace="ed25519-production-test",
+            integrity_key=b"approval-ledger-integrity-key!!!",
         )
         gate = ArmourGate.production(
             self.policy,
@@ -129,6 +131,22 @@ class Ed25519ApprovalTests(unittest.TestCase):
             Verdict.AUTHORIZED,
         )
         self.assertEqual(gate.security_report()["weaknesses"], ())
+
+    def test_production_rejects_non_durable_or_unprotected_ledgers(self):
+        with self.assertRaisesRegex(ValueError, "durable approval ledger"):
+            ArmourGate.production(
+                self.policy,
+                approval_verifier=self.verifier,
+                approval_ledger=InMemoryApprovalLedger(),
+            )
+        with self.assertRaisesRegex(ValueError, "integrity-protected"):
+            ArmourGate.production(
+                self.policy,
+                approval_verifier=self.verifier,
+                approval_ledger=SQLiteApprovalLedger(
+                    Path(self.temp.name) / "unprotected-approvals.sqlite3"
+                ),
+            )
 
 
 if __name__ == "__main__":

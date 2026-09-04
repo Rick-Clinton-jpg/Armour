@@ -51,6 +51,19 @@ class ArmourGate:
             raise ValueError("production mode requires a trusted approval verifier")
         if production_mode and not self.approval_ledger.durable:
             raise ValueError("production mode requires a durable approval ledger")
+        if production_mode and not getattr(
+            approval_verifier, "signing_authority_isolated", False
+        ):
+            raise ValueError(
+                "production mode requires approval signing authority "
+                "isolated from the evaluator"
+            )
+        if production_mode and not getattr(
+            self.approval_ledger, "integrity_protected", False
+        ):
+            raise ValueError(
+                "production mode requires an integrity-protected approval ledger"
+            )
         if approval_verifier is not None and not self.approval_ledger.durable:
             logger.warning(
                 "signed approvals are using process-local replay protection; "
@@ -92,10 +105,27 @@ class ArmourGate:
             weaknesses.append("trusted approval verifier is not configured")
         if not self.approval_ledger.durable:
             weaknesses.append("approval replay protection is process-local")
+        if self.approval_verifier is not None and not getattr(
+            self.approval_verifier, "signing_authority_isolated", False
+        ):
+            weaknesses.append("approval signing authority is evaluator-local")
+        if self.approval_ledger.durable and not getattr(
+            self.approval_ledger, "integrity_protected", False
+        ):
+            weaknesses.append("durable approval ledger is not authenticated")
         return {
             "production_mode": self.production_mode,
             "approval_verification": self.approval_verifier is not None,
             "durable_approval_replay": self.approval_ledger.durable,
+            "isolated_approval_signing": bool(
+                self.approval_verifier is not None
+                and getattr(
+                    self.approval_verifier, "signing_authority_isolated", False
+                )
+            ),
+            "approval_ledger_integrity": bool(
+                getattr(self.approval_ledger, "integrity_protected", False)
+            ),
             "weaknesses": tuple(weaknesses),
         }
 

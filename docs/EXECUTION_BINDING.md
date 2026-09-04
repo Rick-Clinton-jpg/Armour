@@ -1,6 +1,7 @@
 # Execution-Bound Evidence
 
-Status: experimental design for the filesystem-only first implementation.
+Status: experimental implementation for read-only filesystem and HTTP(S)
+dependencies.
 
 ## Problem
 
@@ -13,9 +14,9 @@ race; it does not make the checked object and used object identical.
 
 Execution-Bound Evidence (EBE) binds an authorized execution to host-owned,
 single-use runtime capabilities prepared for the exact proposal and policy.
-The first implementation covers read-only filesystem resources and supplies an
-already-open, no-follow file capability to an explicitly registered bound
-handler.
+The implementation covers read-only filesystem resources and read-only HTTP(S)
+requests. It supplies an already-open, no-follow file or an already-connected
+HTTP capability to an explicitly registered bound handler.
 
 This is an identity-binding guarantee, not a claim that all resource state is
 frozen. An opened file can retain its inode while another process changes its
@@ -46,9 +47,10 @@ contents can change.**
 - Allow observed latency to recommend a tighter deadline only. No runtime
   observation may enlarge the host-owned policy ceiling.
 
-## Non-goals for the first implementation
+## Non-goals
 
-- Network, DNS, API, database, credential, or cross-process capabilities.
+- General API, database, credential, state-changing network, or cross-process
+  capabilities.
 - Automatic latency learning or policy mutation.
 - Durable or transferable evidence tokens.
 - Freezing mutable file contents.
@@ -86,6 +88,54 @@ a different inode.
 The file capability checks its monotonic deadline again at actual access. This
 limits delayed use but does not freeze data stored in the same inode.
 
+## Network capability
+
+`NetworkBinder` supports HTTP and HTTPS with GET and HEAD only. Preparation
+extracts the URL and method from the proposal, checks them against the
+host-owned network policy, resolves the hostname exactly once, and rejects the
+entire result if any returned address is private, loopback, link-local,
+reserved, or otherwise non-public. It then opens a socket directly to one
+verified numeric address. HTTPS still verifies the certificate against the
+original hostname when the default certificate-verifying SSL context is used,
+and sends that hostname through normal HTTP handling. A host may supply a
+custom `ssl.SSLContext`; Armour does not currently reject a context that
+disables certificate or hostname verification, so that configuration can
+weaken HTTPS authentication.
+
+The handler receives `BoundNetworkConnection`, not a URL or a cached DNS
+verdict. Its `request()` method takes no destination, method, headers, or body,
+so the handler cannot substitute those values through the capability. The
+method and request target were fixed during preparation, and the socket was
+already connected to the verified peer. A later DNS change therefore cannot
+redirect that request. HTTP redirect responses are returned to the handler but
+are never followed by the capability.
+
+Both the enclosing execution binding and the network capability check the
+monotonic deadline. The capability permits one request attempt, including when
+the attempt fails, and closes on every executor exit path. Response bodies are
+bounded by a host-configured limit (8 MiB by default).
+
+This guarantee is deliberately narrow:
+
+- It applies only when the registered handler uses the supplied capability. A
+  trusted handler can still open an unrelated socket because Armour is not a
+  process sandbox.
+- It binds the connection's peer IP, original hostname, method, port, and
+  request target for one request. It does not prove that remote content or
+  authorization remains unchanged.
+- A public service can itself proxy, forward, or return attacker-controlled
+  content. Public addressing is not a claim that the remote service is safe.
+- DNS resolution, connection establishment, and TLS occur in the Armour
+  process. The capability is not transferable across processes.
+- Network tests use controlled connections and do not yet include a live HTTPS
+  integration test of DNS, TCP, TLS, and certificate validation together.
+- The maximum-age check happens immediately before request transmission. It
+  does not cancel an in-flight request when the age boundary passes; the
+  separately configured socket timeout bounds that operation.
+- Custom API authentication, request bodies, caller-selected headers,
+  automatic redirects, and state-changing methods are intentionally not
+  supported.
+
 ## Security invariants
 
 1. Exact proposal binding.
@@ -100,10 +150,15 @@ limits delayed use but does not freeze data stored in the same inode.
 10. Path replacement after preparation cannot redirect file access.
 11. Audit-start failure prevents execution.
 12. Audit-completion failure preserves the real handler result.
+13. Every resolved network address must be public.
+14. A bound network request uses the already-connected verified peer and cannot
+    be redirected by a later DNS substitution.
+15. A network capability permits exactly one fixed GET or HEAD attempt and
+    never follows redirects.
 
 ## Future work
 
-Network binding requires a connection or authenticated peer capability, not a
-cached DNS result. External APIs require server-enforced versions, ETags, or
-transaction preconditions. Those designs will be reviewed separately after the
-filesystem abstraction survives adversarial testing.
+External API mutation requires server-enforced versions, ETags, idempotency
+keys, or transaction preconditions; a pinned connection alone is insufficient.
+Database, credential, cross-process, and state-changing network capabilities
+need separate designs and adversarial review.
