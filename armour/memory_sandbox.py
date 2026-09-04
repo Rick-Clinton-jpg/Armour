@@ -38,6 +38,11 @@ class RememberingGate:
             raise ValueError("window_seconds must be positive")
         if not incident_memory.durable:
             raise ValueError("remembering gate requires durable incident memory")
+        retained = getattr(incident_memory, "max_records_per_subject", None)
+        if isinstance(retained, int) and rejection_threshold > retained:
+            raise ValueError(
+                "rejection_threshold cannot exceed per-subject memory retention"
+            )
         self.gate = gate
         self.incident_memory = incident_memory
         self.rejection_threshold = rejection_threshold

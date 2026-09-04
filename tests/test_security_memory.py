@@ -1,7 +1,10 @@
+import gc
+import json
 import os
 import sqlite3
 import tempfile
 import unittest
+import warnings
 from contextlib import closing
 from pathlib import Path
 
@@ -12,6 +15,7 @@ from armour import (
     Policy,
     RememberingGate,
     Risk,
+    SecurityMemoryError,
     SecurityMemorySandbox,
     SQLiteIncidentMemory,
     SQLiteMutantMemory,
@@ -202,6 +206,183 @@ class SecurityMemoryTests(unittest.TestCase):
         sandbox.promote("outside-root", self.attack, promoted_by="reviewer")
         with self.assertRaisesRegex(ValueError, "already exists"):
             sandbox.promote("outside-root", self.attack, promoted_by="reviewer")
+
+    def test_same_proposal_cannot_fill_mutant_memory_under_aliases(self):
+        sandbox = SecurityMemorySandbox(self.remembering_gate(), self.mutant_memory())
+        sandbox.observe("agent-a", self.attack)
+        sandbox.promote("first-name", self.attack, promoted_by="reviewer")
+        with self.assertRaisesRegex(ValueError, "proposal already exists"):
+            sandbox.promote("second-name", self.attack, promoted_by="reviewer")
+
+    def test_initial_mutant_schema_migrates_and_collapses_exact_aliases(self):
+        proposal_json = json.dumps(
+            {
+                "id": self.attack.id,
+                "action": self.attack.action,
+                "effect": self.attack.effect.value,
+                "risk": self.attack.risk.name.lower(),
+                "resource": self.attack.resource,
+                "method": self.attack.method,
+                "payload": self.attack.payload_data(),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        with closing(sqlite3.connect(self.db)) as connection:
+            connection.execute(
+                """
+                CREATE TABLE armour_schema (
+                    component TEXT PRIMARY KEY, version INTEGER NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                "INSERT INTO armour_schema VALUES ('mutant_memory', 1)"
+            )
+            connection.execute(
+                """
+                CREATE TABLE remembered_mutants (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    deployment_namespace TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    proposal_json TEXT NOT NULL,
+                    expected_verdicts_json TEXT NOT NULL,
+                    policy_fingerprint TEXT NOT NULL,
+                    promoted_by TEXT NOT NULL,
+                    source_incident_id INTEGER,
+                    created_at REAL NOT NULL,
+                    UNIQUE (deployment_namespace, name)
+                )
+                """
+            )
+            for name in ("first", "alias"):
+                connection.execute(
+                    """
+                    INSERT INTO remembered_mutants (
+                        deployment_namespace, name, proposal_json,
+                        expected_verdicts_json, policy_fingerprint, promoted_by,
+                        source_incident_id, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "tests", name, proposal_json, '["rejected"]',
+                        self.policy.fingerprint(), "reviewer", None, self.clock(),
+                    ),
+                )
+            connection.commit()
+        memory = self.mutant_memory()
+        self.assertEqual([mutant.name for mutant in memory.mutants()], ["first"])
+        with closing(sqlite3.connect(self.db)) as connection:
+            version = connection.execute(
+                "SELECT version FROM armour_schema WHERE component = 'mutant_memory'"
+            ).fetchone()[0]
+        self.assertEqual(version, 2)
+
+    def test_incident_memory_retains_bounded_recent_history(self):
+        memory = SQLiteIncidentMemory(
+            self.db,
+            deployment_namespace="bounded",
+            wall_clock=self.clock,
+            max_records_per_subject=3,
+            max_records_total=4,
+        )
+        for index in range(5):
+            proposal = ActionProposal(
+                "read", Effect.READ_ONLY, Risk.LOW,
+                resource=str(self.secret), id=f"bounded-{index}",
+            )
+            memory.record_rejection(
+                "agent-a",
+                proposal,
+                ArmourGate(self.policy).evaluate(proposal),
+            )
+        self.assertEqual(len(memory.incidents("agent-a")), 3)
+
+    def test_total_capacity_cannot_evict_another_subject_history(self):
+        memory = SQLiteIncidentMemory(
+            self.db,
+            deployment_namespace="total-capacity",
+            wall_clock=self.clock,
+            max_records_per_subject=2,
+            max_records_total=2,
+        )
+        decision = ArmourGate(self.policy).evaluate(self.attack)
+        memory.record_rejection("agent-a", self.attack, decision)
+        second = ActionProposal(
+            "read", Effect.READ_ONLY, Risk.LOW,
+            resource=str(self.secret), id="second-a",
+        )
+        memory.record_rejection(
+            "agent-a", second, ArmourGate(self.policy).evaluate(second)
+        )
+        with self.assertRaisesRegex(SecurityMemoryError, "capacity"):
+            memory.record_rejection("agent-b", self.attack, decision)
+        self.assertEqual(len(memory.incidents("agent-a")), 2)
+
+    def test_incident_rejects_decision_for_different_proposal(self):
+        memory = SQLiteIncidentMemory(self.db, deployment_namespace="mismatch")
+        decision = ArmourGate(self.policy).evaluate(self.attack)
+        other = ActionProposal(
+            "read", Effect.READ_ONLY, Risk.LOW,
+            resource=str(self.secret), id="different-proposal",
+        )
+        with self.assertRaisesRegex(ValueError, "identifiers must match"):
+            memory.record_rejection("agent-a", other, decision)
+
+    def test_quarantine_threshold_cannot_exceed_retained_history(self):
+        memory = SQLiteIncidentMemory(
+            self.db,
+            deployment_namespace="threshold",
+            max_records_per_subject=2,
+            max_records_total=10,
+        )
+        with self.assertRaisesRegex(ValueError, "retention"):
+            RememberingGate(
+                ArmourGate(self.policy), memory, rejection_threshold=3
+            )
+
+    def test_mutant_memory_refuses_writes_at_capacity(self):
+        memory = SQLiteMutantMemory(
+            self.db,
+            deployment_namespace="capacity",
+            wall_clock=self.clock,
+            max_mutants=2,
+        )
+        for index in range(2):
+            memory.remember(
+                f"mutant-{index}",
+                ActionProposal(
+                    "read", Effect.READ_ONLY, Risk.LOW,
+                    resource=str(self.secret), id=f"capacity-{index}",
+                ),
+                expected_verdicts=frozenset({Verdict.REJECTED}),
+                policy_fingerprint=self.policy.fingerprint(),
+                promoted_by="reviewer",
+            )
+        with self.assertRaisesRegex(ValueError, "capacity"):
+            memory.remember(
+                "mutant-3",
+                ActionProposal(
+                    "read", Effect.READ_ONLY, Risk.LOW,
+                    resource=str(self.secret), id="capacity-3",
+                ),
+                expected_verdicts=frozenset({Verdict.REJECTED}),
+                policy_fingerprint=self.policy.fingerprint(),
+                promoted_by="reviewer",
+            )
+
+    def test_corrupt_database_fails_without_leaking_connection(self):
+        gate = self.remembering_gate()
+        gate.evaluate(self.attack, subject_id="agent-a")
+        self.db.write_bytes(b"not a sqlite database")
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always", ResourceWarning)
+            with self.assertRaises(Exception):
+                gate.evaluate(self.safe_proposal, subject_id="agent-a")
+            gc.collect()
+        self.assertFalse(
+            [item for item in captured if issubclass(item.category, ResourceWarning)]
+        )
 
 
 if __name__ == "__main__":

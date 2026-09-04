@@ -16,6 +16,10 @@ can never authorize something the underlying `ArmourGate` rejected.
 The host must authenticate `subject_id`; letting an agent choose it permits
 identity rotation or framing. The time window allows old incidents to stop
 causing an active quarantine while retaining their forensic record.
+Per-subject and per-deployment ceilings bound storage growth. Old entries for a
+single subject rotate while preserving enough recent entries for quarantine.
+If the deployment-wide ceiling would be exceeded, the write fails instead of
+evicting another subject's security history.
 
 ## Mutant memory
 
@@ -24,6 +28,10 @@ Python callbacks or automatically converts traffic into executable tests. A
 trusted reviewer must explicitly promote a proposal that incident memory has
 already observed as rejected. Replaying the remembered mutants against a new
 policy exposes any case that becomes authorized.
+Exact proposal fingerprints are unique and a configurable capacity stops alias
+names or endless reviewed variants from growing the store without limit.
+Opening the initial schema upgrades it in place and retains the earliest record
+when that older database already contains exact proposal aliases.
 
 ## Why they remain separate
 
