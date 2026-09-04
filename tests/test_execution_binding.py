@@ -192,6 +192,10 @@ class ExecutionBindingInvariantTests(unittest.TestCase):
         )
         self.assertNotEqual(self.policy.fingerprint(), revised.fingerprint())
 
+    def test_dependency_age_has_absolute_freshness_ceiling(self):
+        with self.assertRaisesRegex(ValueError, "at most 60000"):
+            DependencyPolicy(kind="filesystem", max_age_ms=60_001)
+
     def test_agent_cannot_select_dependency_class_or_extend_deadline(self):
         proposal = ActionProposal.from_untrusted(
             {

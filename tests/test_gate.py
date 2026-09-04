@@ -1,3 +1,5 @@
+import hashlib
+import hmac
 import tempfile
 import unittest
 from dataclasses import replace
@@ -163,6 +165,78 @@ class GateTests(unittest.TestCase):
         decision = ArmourGate(self.policy).evaluate(proposal, approval=approval)
         self.assertIs(decision.verdict, Verdict.ESCALATED)
         self.assertIn("approval has expired", decision.reasons)
+
+    def test_approval_lifetime_above_hard_ceiling_is_rejected(self):
+        proposal = ActionProposal("delete_file", Effect.DESTRUCTIVE, Risk.HIGH)
+        with self.assertRaisesRegex(ValueError, "at most"):
+            self.approval(proposal, ttl_seconds=3601)
+
+    def test_gate_rejects_approval_with_excessive_signed_lifetime(self):
+        proposal = ActionProposal("delete_file", Effect.DESTRUCTIVE, Risk.HIGH)
+        issued = datetime.now(timezone.utc)
+        approval = self.approval(proposal)
+        approval = replace(
+            approval,
+            timestamp=issued.isoformat(),
+            expires_at=(issued + timedelta(seconds=301)).isoformat(),
+        )
+        approval = replace(
+            approval,
+            signature=hmac.new(
+                self.approval_key,
+                approval.canonical_payload(),
+                hashlib.sha256,
+            ).hexdigest(),
+        )
+        decision = ArmourGate(
+            self.policy,
+            approval_verifier=self.approval_verifier,
+            max_approval_lifetime_seconds=300,
+        ).evaluate(proposal, approval=approval)
+        self.assertIs(decision.verdict, Verdict.ESCALATED)
+        self.assertIn("approval lifetime exceeds configured maximum", decision.reasons)
+
+    def test_trusted_approval_clock_can_fail_closed(self):
+        proposal = ActionProposal("delete_file", Effect.DESTRUCTIVE, Risk.HIGH)
+        gate = ArmourGate(
+            self.policy,
+            approval_verifier=self.approval_verifier,
+            approval_clock=lambda: (_ for _ in ()).throw(RuntimeError("clock down")),
+        )
+        with self.assertLogs("armour.gate", level="ERROR"):
+            decision = gate.evaluate(proposal, approval=self.approval(proposal))
+        self.assertIs(decision.verdict, Verdict.ESCALATED)
+        self.assertIn("trusted approval clock unavailable", decision.reasons)
+
+    def test_future_signed_timestamp_is_rejected_by_trusted_clock(self):
+        proposal = ActionProposal("delete_file", Effect.DESTRUCTIVE, Risk.HIGH)
+        now = datetime.now(timezone.utc)
+        approval = self.approval(proposal)
+        approval = replace(
+            approval,
+            timestamp=(now + timedelta(seconds=31)).isoformat(),
+            expires_at=(now + timedelta(seconds=331)).isoformat(),
+        )
+        approval = replace(
+            approval,
+            signature=hmac.new(
+                self.approval_key,
+                approval.canonical_payload(),
+                hashlib.sha256,
+            ).hexdigest(),
+        )
+        gate = ArmourGate(
+            self.policy,
+            approval_verifier=self.approval_verifier,
+            approval_clock=lambda: now,
+        )
+        decision = gate.evaluate(proposal, approval=approval)
+        self.assertIs(decision.verdict, Verdict.ESCALATED)
+        self.assertIn("approval timestamp is in the future", decision.reasons)
+
+    def test_gate_approval_lifetime_configuration_cannot_raise_hard_ceiling(self):
+        with self.assertRaisesRegex(ValueError, "at most"):
+            ArmourGate(self.policy, max_approval_lifetime_seconds=3601)
 
     def test_policy_effect_overrides_model_understatement(self):
         proposal = ActionProposal("delete_file", Effect.READ_ONLY, Risk.LOW)

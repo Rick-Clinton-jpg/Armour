@@ -9,10 +9,11 @@ which mutants survived.
 from __future__ import annotations
 
 from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 import shutil
 import sqlite3
+import ssl
 import tempfile
 from typing import Callable, Iterable
 
@@ -25,6 +26,12 @@ from .ledger import (
     SQLiteApprovalLedger,
 )
 from .memory_sandbox import RememberingGate, SecurityMemorySandbox
+from .mirror_loop import (
+    MirrorLoopMismatch,
+    MirrorLoopPolicy,
+    MirrorLoopTerminated,
+    prepare_mirror_loop,
+)
 from .models import ActionProposal, Effect, HumanApproval, Risk, Verdict
 from .network_binding import NetworkBinder
 from .policy import Policy
@@ -241,16 +248,27 @@ STANDARD_INVARIANTS = frozenset(
         "production_isolated_signing",
         "production_durable_ledger",
         "production_ledger_integrity",
+        "production_action_schemas",
+        "approval_lifetime_ceiling",
         "approval_ledger_row_integrity",
         "approval_ledger_nonce_durability",
         "approval_ledger_rollback_detection",
         "approval_ledger_key_integrity",
+        "approval_ledger_capacity",
         "network_destination_binding",
         "network_public_destination",
         "network_method_binding",
+        "network_tls_authentication",
+        "binding_freshness_ceiling",
         "security_memory_integrity",
         "security_memory_quarantine",
         "security_memory_review_gate",
+        "mirror_authorization_boundary",
+        "mirror_scope_binding",
+        "mirror_resource_bounds",
+        "mirror_absolute_ceiling",
+        "mirror_display_safety",
+        "mirror_exact_input_type",
     }
 )
 
@@ -392,6 +410,35 @@ def _production_unprotected_probe(
     )
 
 
+def _production_missing_schema_probe(
+    gate: ArmourGate, _baseline: ActionProposal
+) -> BoundaryProbeResult:
+    return _expected_failure(
+        lambda: ArmourGate.production(
+            replace(gate.policy, action_schemas={}),
+            approval_verifier=_IsolatedVerifier(),
+            approval_ledger=_DurableLedger(integrity_protected=True),
+        ),
+        ValueError,
+        "production rejected an allowed action without a strict schema",
+    )
+
+
+def _approval_lifetime_ceiling_probe(
+    gate: ArmourGate, baseline: ActionProposal
+) -> BoundaryProbeResult:
+    return _expected_failure(
+        lambda: HumanApproval.issue(
+            baseline,
+            policy_fingerprint=gate.policy.fingerprint(),
+            approved_by="offline-mutation-harness",
+            ttl_seconds=3_601,
+        ),
+        ValueError,
+        "approval issuance rejected a lifetime above the hard ceiling",
+    )
+
+
 def _approval(baseline: ActionProposal, policy: Policy, nonce: str) -> HumanApproval:
     approval = HumanApproval.issue(
         baseline,
@@ -406,7 +453,38 @@ def _approval(baseline: ActionProposal, policy: Policy, nonce: str) -> HumanAppr
         approved_by=approval.approved_by,
         expires_at=approval.expires_at,
         nonce=nonce,
+        timestamp=approval.timestamp,
         key_id=approval.key_id,
+    )
+
+
+def _ledger_capacity_probe(
+    gate: ArmourGate, baseline: ActionProposal
+) -> BoundaryProbeResult:
+    def attack() -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = SQLiteApprovalLedger(
+                Path(directory) / "ledger.sqlite3",
+                integrity_key=b"c" * 32,
+                max_claims=1,
+            )
+            ledger.claim(_approval(baseline, gate.policy, "capacity-first"))
+            ledger.claim(_approval(baseline, gate.policy, "capacity-overflow"))
+
+    return _expected_failure(
+        attack,
+        ApprovalLedgerError,
+        "approval ledger rejected growth beyond its configured capacity",
+    )
+
+
+def _network_insecure_tls_probe(
+    _gate: ArmourGate, _baseline: ActionProposal
+) -> BoundaryProbeResult:
+    return _expected_failure(
+        lambda: NetworkBinder(ssl_context=ssl._create_unverified_context()),
+        ValueError,
+        "network binder rejected disabled TLS authentication",
     )
 
 
@@ -590,6 +668,16 @@ def _network_method_probe(
     )
 
 
+def _binding_freshness_ceiling_probe(
+    _gate: ArmourGate, _baseline: ActionProposal
+) -> BoundaryProbeResult:
+    return _expected_failure(
+        lambda: DependencyPolicy("filesystem", max_age_ms=60_001),
+        ValueError,
+        "execution binding rejected a deadline above its freshness ceiling",
+    )
+
+
 def _memory_integrity_probe(
     gate: ArmourGate, baseline: ActionProposal
 ) -> BoundaryProbeResult:
@@ -656,6 +744,170 @@ def _memory_review_gate_probe(
 
     return _expected_failure(
         attack, ValueError, "unobserved proposal could not enter mutant memory"
+    )
+
+
+def _mirror_authorized_diversion_probe(
+    gate: ArmourGate, baseline: ActionProposal
+) -> BoundaryProbeResult:
+    decision = gate.evaluate(baseline)
+    return _expected_failure(
+        lambda: prepare_mirror_loop(
+            baseline,
+            decision,
+            policy_fingerprint=gate.policy.fingerprint(),
+            execution_id="mirror-probe",
+            mirror_policy=MirrorLoopPolicy(),
+        ),
+        MirrorLoopMismatch,
+        "authorized proposal could not be diverted into deception",
+    )
+
+
+def _mirror_scope_substitution_probe(
+    gate: ArmourGate, baseline: ActionProposal
+) -> BoundaryProbeResult:
+    rejected = ActionProposal(
+        f"{baseline.action}_unknown", Effect.DESTRUCTIVE, Risk.CRITICAL
+    )
+    decision = gate.evaluate(rejected)
+    chamber = prepare_mirror_loop(
+        rejected,
+        decision,
+        policy_fingerprint=gate.policy.fingerprint(),
+        execution_id="mirror-probe",
+        mirror_policy=MirrorLoopPolicy(),
+        monotonic_ns=lambda: 1_000_000_000,
+    )
+    return _expected_failure(
+        lambda: chamber.submit(
+            "attempt",
+            proposal=rejected,
+            policy_fingerprint=gate.policy.fingerprint(),
+            execution_id="substituted-execution",
+        ),
+        MirrorLoopMismatch,
+        "mirror loop rejected cross-execution substitution",
+    )
+
+
+def _mirror_resource_exhaustion_probe(
+    gate: ArmourGate, baseline: ActionProposal
+) -> BoundaryProbeResult:
+    rejected = ActionProposal(
+        f"{baseline.action}_unknown", Effect.DESTRUCTIVE, Risk.CRITICAL
+    )
+    decision = gate.evaluate(rejected)
+    chamber = prepare_mirror_loop(
+        rejected,
+        decision,
+        policy_fingerprint=gate.policy.fingerprint(),
+        execution_id="mirror-budget-probe",
+        mirror_policy=MirrorLoopPolicy(max_steps=1, repeat_limit=2),
+        monotonic_ns=lambda: 1_000_000_000,
+    )
+    chamber.submit(
+        "first attempt",
+        proposal=rejected,
+        policy_fingerprint=gate.policy.fingerprint(),
+        execution_id="mirror-budget-probe",
+    )
+    return _expected_failure(
+        lambda: chamber.submit(
+            "second attempt",
+            proposal=rejected,
+            policy_fingerprint=gate.policy.fingerprint(),
+            execution_id="mirror-budget-probe",
+        ),
+        MirrorLoopTerminated,
+        "mirror loop enforced its host-owned step budget",
+    )
+
+
+def _mirror_absolute_ceiling_probe(
+    _gate: ArmourGate, _baseline: ActionProposal
+) -> BoundaryProbeResult:
+    return _expected_failure(
+        lambda: MirrorLoopPolicy(max_steps=65),
+        ValueError,
+        "mirror loop rejected configuration above its absolute step ceiling",
+    )
+
+
+def _mirror_display_safety_probe(
+    gate: ArmourGate, baseline: ActionProposal
+) -> BoundaryProbeResult:
+    rejected = ActionProposal(
+        f"{baseline.action}_unknown", Effect.DESTRUCTIVE, Risk.CRITICAL
+    )
+    decision = gate.evaluate(rejected)
+    chamber = prepare_mirror_loop(
+        rejected,
+        decision,
+        policy_fingerprint=gate.policy.fingerprint(),
+        execution_id="mirror-display-probe",
+        mirror_policy=MirrorLoopPolicy(),
+        monotonic_ns=lambda: 1_000_000_000,
+    )
+    observation = chamber.submit(
+        "safe\x1b[2J\x9b31m\x7f\u202etext",
+        proposal=rejected,
+        policy_fingerprint=gate.policy.fingerprint(),
+        execution_id="mirror-display-probe",
+    )
+    displayed = observation.reflection.display_text
+    if all(character.isprintable() for character in displayed) and all(
+        token in displayed for token in ("<U+001B>", "<U+009B>", "<U+007F>", "<U+202E>")
+    ):
+        return BoundaryProbeResult(
+            Verdict.REJECTED,
+            ("mirror loop neutralized terminal and Unicode controls",),
+        )
+    return BoundaryProbeResult(
+        Verdict.AUTHORIZED,
+        ("mirror loop returned active terminal or Unicode controls",),
+    )
+
+
+def _mirror_input_subclass_probe(
+    gate: ArmourGate, baseline: ActionProposal
+) -> BoundaryProbeResult:
+    called = False
+
+    class HostileString(str):
+        def encode(self, *args: object, **kwargs: object) -> bytes:
+            nonlocal called
+            called = True
+            return super().encode(*args, **kwargs)
+
+    rejected = ActionProposal(
+        f"{baseline.action}_unknown", Effect.DESTRUCTIVE, Risk.CRITICAL
+    )
+    decision = gate.evaluate(rejected)
+    chamber = prepare_mirror_loop(
+        rejected,
+        decision,
+        policy_fingerprint=gate.policy.fingerprint(),
+        execution_id="mirror-input-probe",
+        mirror_policy=MirrorLoopPolicy(),
+        monotonic_ns=lambda: 1_000_000_000,
+    )
+    try:
+        chamber.submit(
+            HostileString("attempt"),
+            proposal=rejected,
+            policy_fingerprint=gate.policy.fingerprint(),
+            execution_id="mirror-input-probe",
+        )
+    except MirrorLoopTerminated:
+        if not called:
+            return BoundaryProbeResult(
+                Verdict.REJECTED,
+                ("mirror loop rejected a string subclass before method dispatch",),
+            )
+    return BoundaryProbeResult(
+        Verdict.AUTHORIZED,
+        ("mirror loop invoked or accepted a string-subclass method",),
     )
 
 
@@ -768,6 +1020,20 @@ def standard_mutant_family(
                 frozenset({Verdict.REJECTED}),
             ),
             BoundaryMutation(
+                "production-missing-action-schema",
+                "attempt production construction with an unstructured action payload",
+                "production_action_schemas",
+                _production_missing_schema_probe,
+                frozenset({Verdict.REJECTED}),
+            ),
+            BoundaryMutation(
+                "approval-excessive-signed-lifetime",
+                "issue an approval beyond Armour's absolute lifetime ceiling",
+                "approval_lifetime_ceiling",
+                _approval_lifetime_ceiling_probe,
+                frozenset({Verdict.REJECTED}),
+            ),
+            BoundaryMutation(
                 "approval-ledger-row-tamper",
                 "rewrite a claimed approval row behind the integrity seal",
                 "approval_ledger_row_integrity",
@@ -796,6 +1062,13 @@ def standard_mutant_family(
                 frozenset({Verdict.REJECTED}),
             ),
             BoundaryMutation(
+                "approval-ledger-capacity-exhaustion",
+                "grow authenticated replay state beyond its configured hard capacity",
+                "approval_ledger_capacity",
+                _ledger_capacity_probe,
+                frozenset({Verdict.REJECTED}),
+            ),
+            BoundaryMutation(
                 "network-destination-substitution",
                 "change DNS after binding preparation",
                 "network_destination_binding",
@@ -817,6 +1090,20 @@ def standard_mutant_family(
                 frozenset({Verdict.REJECTED}),
             ),
             BoundaryMutation(
+                "network-insecure-tls-context",
+                "disable certificate and hostname verification on the network binder",
+                "network_tls_authentication",
+                _network_insecure_tls_probe,
+                frozenset({Verdict.REJECTED}),
+            ),
+            BoundaryMutation(
+                "binding-excessive-freshness-window",
+                "configure execution binding above Armour's freshness ceiling",
+                "binding_freshness_ceiling",
+                _binding_freshness_ceiling_probe,
+                frozenset({Verdict.REJECTED}),
+            ),
+            BoundaryMutation(
                 "security-memory-row-tamper",
                 "rewrite a recorded incident behind its integrity seal",
                 "security_memory_integrity",
@@ -835,6 +1122,48 @@ def standard_mutant_family(
                 "promote a proposal that has no observed rejected incident",
                 "security_memory_review_gate",
                 _memory_review_gate_probe,
+                frozenset({Verdict.REJECTED}),
+            ),
+            BoundaryMutation(
+                "mirror-authorized-diversion",
+                "divert an authorized proposal into the deception chamber",
+                "mirror_authorization_boundary",
+                _mirror_authorized_diversion_probe,
+                frozenset({Verdict.REJECTED}),
+            ),
+            BoundaryMutation(
+                "mirror-scope-substitution",
+                "transplant a mirror session into another execution",
+                "mirror_scope_binding",
+                _mirror_scope_substitution_probe,
+                frozenset({Verdict.REJECTED}),
+            ),
+            BoundaryMutation(
+                "mirror-resource-exhaustion",
+                "continue submitting attempts after the host-owned step ceiling",
+                "mirror_resource_bounds",
+                _mirror_resource_exhaustion_probe,
+                frozenset({Verdict.REJECTED}),
+            ),
+            BoundaryMutation(
+                "mirror-absolute-ceiling",
+                "configure the deception chamber above Armour's hard step ceiling",
+                "mirror_absolute_ceiling",
+                _mirror_absolute_ceiling_probe,
+                frozenset({Verdict.REJECTED}),
+            ),
+            BoundaryMutation(
+                "mirror-terminal-control-reflection",
+                "reflect active terminal, Unicode, and display-control characters",
+                "mirror_display_safety",
+                _mirror_display_safety_probe,
+                frozenset({Verdict.REJECTED}),
+            ),
+            BoundaryMutation(
+                "mirror-hostile-string-subclass",
+                "supply a string subclass with an attacker-controlled encode method",
+                "mirror_exact_input_type",
+                _mirror_input_subclass_probe,
                 frozenset({Verdict.REJECTED}),
             ),
         )

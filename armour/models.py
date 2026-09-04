@@ -6,13 +6,17 @@ from copy import deepcopy
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from enum import IntEnum, StrEnum
+import hashlib
+import hmac
+import json
 from types import MappingProxyType
 from typing import Any, Mapping
 from uuid import uuid4
 
-import hashlib
-import hmac
-import json
+from .limits import bounded_positive_int
+
+
+MAX_APPROVAL_LIFETIME_SECONDS = 3_600
 
 
 def _freeze_json(value: Any) -> Any:
@@ -180,8 +184,11 @@ class HumanApproval:
         signing_key: bytes | None = None,
         key_id: str = "",
     ) -> "HumanApproval":
-        if ttl_seconds <= 0:
-            raise ValueError("approval TTL must be positive")
+        bounded_positive_int(
+            ttl_seconds,
+            name="approval TTL seconds",
+            hard_max=MAX_APPROVAL_LIFETIME_SECONDS,
+        )
         if signing_key is not None and (not signing_key or not key_id):
             raise ValueError("signed approvals require a non-empty key and key_id")
         expires = datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)

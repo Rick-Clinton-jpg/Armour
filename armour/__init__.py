@@ -26,6 +26,18 @@ from .executor import GuardedExecutor
 from .filesystem_binding import BoundFile, FilesystemBinder
 from .network_binding import BoundNetworkConnection, NetworkBinder, NetworkResponse
 from .memory_sandbox import RememberingGate, SecurityMemorySandbox
+from .mirror_loop import (
+    ControlEscapedReflection,
+    MirrorEvidence,
+    MirrorLoop,
+    MirrorLoopError,
+    MirrorLoopExpired,
+    MirrorLoopMismatch,
+    MirrorLoopPolicy,
+    MirrorLoopTerminated,
+    MirrorObservation,
+    prepare_mirror_loop,
+)
 from .evaluation import (
     BoundaryMutation,
     BoundaryProbeResult,
@@ -88,6 +100,7 @@ __all__ = [
     "BoundFile",
     "BoundNetworkConnection",
     "Decision",
+    "ControlEscapedReflection",
     "Ed25519ApprovalSigner",
     "Ed25519ApprovalVerifier",
     "Effect",
@@ -102,6 +115,14 @@ __all__ = [
     "InMemoryApprovalLedger",
     "IncidentRecord",
     "MemoryCheckpoint",
+    "MirrorEvidence",
+    "MirrorLoop",
+    "MirrorLoopError",
+    "MirrorLoopExpired",
+    "MirrorLoopMismatch",
+    "MirrorLoopPolicy",
+    "MirrorLoopTerminated",
+    "MirrorObservation",
     "Mutation",
     "MutationOutcome",
     "MutationReport",
@@ -128,6 +149,7 @@ __all__ = [
     "Verdict",
     "open_beneath",
     "prepare_execution_binding",
+    "prepare_mirror_loop",
     "read_text_beneath",
     "standard_mutant_family",
 ]

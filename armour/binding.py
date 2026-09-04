@@ -4,15 +4,18 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-import math
 from threading import Lock
 from typing import Any, Protocol, TYPE_CHECKING
 from uuid import uuid4
 
+from .limits import bounded_positive_finite
 from .models import ActionProposal
 
 if TYPE_CHECKING:
     from .policy import Policy
+
+
+MAX_DEPENDENCY_AGE_MS = 60_000
 
 
 class BindingError(RuntimeError):
@@ -41,13 +44,11 @@ class DependencyPolicy:
     def __post_init__(self) -> None:
         if not isinstance(self.kind, str) or not self.kind:
             raise TypeError("dependency kind must be a non-empty string")
-        if (
-            not isinstance(self.max_age_ms, (int, float))
-            or isinstance(self.max_age_ms, bool)
-            or not math.isfinite(self.max_age_ms)
-            or self.max_age_ms <= 0
-        ):
-            raise ValueError("dependency max_age_ms must be finite and positive")
+        bounded_positive_finite(
+            self.max_age_ms,
+            name="dependency max_age_ms",
+            hard_max=MAX_DEPENDENCY_AGE_MS,
+        )
 
     def to_dict(self) -> dict[str, str | float]:
         return {"kind": self.kind, "max_age_ms": self.max_age_ms}
