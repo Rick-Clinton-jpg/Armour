@@ -31,6 +31,7 @@ from .evaluation import (
 from .gate import ArmourGate
 from .ledger import (
     ApprovalClaim,
+    ApprovalCheckpoint,
     ApprovalLedger,
     ApprovalLedgerError,
     InMemoryApprovalLedger,
@@ -65,6 +66,7 @@ __all__ = [
     "ActionSchema",
     "ApprovalVerifier",
     "ApprovalClaim",
+    "ApprovalCheckpoint",
     "ApprovalLedger",
     "ApprovalLedgerError",
     "ArmourGate",

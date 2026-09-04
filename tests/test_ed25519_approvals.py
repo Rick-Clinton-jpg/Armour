@@ -118,6 +118,7 @@ class Ed25519ApprovalTests(unittest.TestCase):
         ledger = SQLiteApprovalLedger(
             Path(self.temp.name) / "approvals.sqlite3",
             deployment_namespace="ed25519-production-test",
+            integrity_key=b"approval-ledger-integrity-key!!!",
         )
         gate = ArmourGate.production(
             self.policy,

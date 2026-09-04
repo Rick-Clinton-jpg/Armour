@@ -1,10 +1,12 @@
 import hashlib
 import hmac
+import shutil
 import sqlite3
 import stat
 import tempfile
 import threading
 import unittest
+from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
 
@@ -27,6 +29,7 @@ class ApprovalLedgerTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.database = Path(self.temp.name) / "approval-ledger.sqlite3"
         self.key = b"durable-approval-test-key"
+        self.integrity_key = b"i" * 32
         self.verifier = HMACApprovalVerifier({"reviewer-key": self.key})
         self.policy = Policy(
             allowed_actions=frozenset({"delete"}),
@@ -93,6 +96,33 @@ class ApprovalLedgerTests(unittest.TestCase):
         for thread in threads:
             thread.join()
         self.assertCountEqual(verdicts, [Verdict.AUTHORIZED, Verdict.ESCALATED])
+
+    def test_two_integrity_protected_ledgers_remain_consistent(self):
+        ledgers = [
+            SQLiteApprovalLedger(
+                self.database, integrity_key=self.integrity_key
+            ),
+            SQLiteApprovalLedger(
+                self.database, integrity_key=self.integrity_key
+            ),
+        ]
+        barrier = threading.Barrier(2)
+        results = []
+        result_lock = threading.Lock()
+
+        def claim(ledger):
+            barrier.wait()
+            claimed = ledger.claim(self.approval)
+            with result_lock:
+                results.append(claimed)
+
+        threads = [threading.Thread(target=claim, args=(ledger,)) for ledger in ledgers]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertCountEqual(results, [True, False])
+        self.assertEqual(len(ledgers[0].claims()), 1)
 
     def test_policy_change_does_not_reset_nonce_history(self):
         first = self.gate(SQLiteApprovalLedger(self.database))
@@ -186,16 +216,13 @@ class ApprovalLedgerTests(unittest.TestCase):
                 approval_verifier=self.verifier,
                 production_mode=True,
             )
-        gate = self.gate(
-            SQLiteApprovalLedger(self.database), production_mode=True
-        )
-        self.assertEqual(gate.security_report()["weaknesses"], ())
-        factory_gate = ArmourGate.production(
-            self.policy,
-            approval_verifier=self.verifier,
-            approval_ledger=SQLiteApprovalLedger(self.database),
-        )
-        self.assertTrue(factory_gate.security_report()["production_mode"])
+        with self.assertRaisesRegex(ValueError, "isolated from the evaluator"):
+            self.gate(
+                SQLiteApprovalLedger(
+                    self.database, integrity_key=b"x" * 32
+                ),
+                production_mode=True,
+            )
 
     def test_namespaces_are_independent_deployments(self):
         first = self.gate(
@@ -231,6 +258,84 @@ class ApprovalLedgerTests(unittest.TestCase):
         SQLiteApprovalLedger(self.database)
         mode = stat.S_IMODE(self.database.stat().st_mode)
         self.assertEqual(mode, 0o600)
+
+    def test_direct_claim_tampering_fails_closed(self):
+        ledger = SQLiteApprovalLedger(
+            self.database, integrity_key=self.integrity_key
+        )
+        self.assertTrue(ledger.claim(self.approval))
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "UPDATE approval_claims SET nonce = 'attacker-rewrite'"
+            )
+            connection.commit()
+        with self.assertRaisesRegex(ApprovalLedgerError, "integrity"):
+            ledger.claims()
+
+    def test_wrong_ledger_integrity_key_fails_closed(self):
+        ledger = SQLiteApprovalLedger(
+            self.database, integrity_key=self.integrity_key
+        )
+        self.assertTrue(ledger.claim(self.approval))
+        with self.assertRaisesRegex(ApprovalLedgerError, "integrity"):
+            SQLiteApprovalLedger(
+                self.database, integrity_key=b"different-key-material".ljust(32, b"!")
+            )
+
+    def test_existing_claims_require_explicit_one_time_sealing(self):
+        legacy = SQLiteApprovalLedger(self.database)
+        self.assertTrue(legacy.claim(self.approval))
+        with self.assertRaisesRegex(ApprovalLedgerError, "unsealed"):
+            SQLiteApprovalLedger(
+                self.database, integrity_key=self.integrity_key
+            )
+        sealed = SQLiteApprovalLedger(
+            self.database,
+            integrity_key=self.integrity_key,
+            trust_existing_claims=True,
+        )
+        self.assertEqual(len(sealed.claims()), 1)
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute("DELETE FROM approval_ledger_integrity")
+            connection.commit()
+        with self.assertRaisesRegex(ApprovalLedgerError, "unsealed"):
+            sealed.claims()
+
+    def test_checkpoint_detects_valid_ledger_rollback(self):
+        class Checkpoint:
+            def __init__(self):
+                self.generation = None
+
+            def read_generation(self, _namespace):
+                return self.generation
+
+            def advance_generation(self, _namespace, generation):
+                current = -1 if self.generation is None else self.generation
+                self.generation = max(current, generation)
+
+        checkpoint = Checkpoint()
+        ledger = SQLiteApprovalLedger(
+            self.database,
+            integrity_key=self.integrity_key,
+            checkpoint=checkpoint,
+        )
+        self.assertTrue(ledger.claim(self.approval))
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        snapshot = Path(self.temp.name) / "old-valid-ledger.sqlite3"
+        shutil.copyfile(self.database, snapshot)
+        another = replace(self.approval, nonce="second-valid-nonce")
+        another = self.resign(replace(another, signature=""))
+        self.assertTrue(ledger.claim(another))
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        shutil.copyfile(snapshot, self.database)
+        with self.assertRaisesRegex(ApprovalLedgerError, "rollback"):
+            SQLiteApprovalLedger(
+                self.database,
+                integrity_key=self.integrity_key,
+                checkpoint=checkpoint,
+            )
 
 
 if __name__ == "__main__":

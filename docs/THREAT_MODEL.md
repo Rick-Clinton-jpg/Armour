@@ -67,10 +67,19 @@ Policy construction fails if any allowed action lacks a human-owned effect class
   checkpoint durability, and disk exhaustion remain host responsibilities.
 - A hostname can resolve differently between verification and connection; network handlers must pin or re-verify the actual connected address.
 - Development mode falls back to a process-local approval ledger. Production mode requires durable replay storage.
-- `SQLiteApprovalLedger` coordinates processes sharing one database file; separate hosts require a host-provided atomic `ApprovalLedger` implementation.
-- An attacker able to replace or roll back the replay database can undermine nonce history; protect the ledger as security state.
-- The reference HMAC verifier shares signing authority with the evaluator. Use `Ed25519ApprovalVerifier` when approval issuance must remain isolated from that process.
+- `SQLiteApprovalLedger` coordinates processes sharing one database file and
+  authenticates production claim state with a host-held key. Separate hosts
+  require a host-provided atomic `ApprovalLedger` implementation.
+- Direct replay-ledger edits fail closed while its integrity key remains secret.
+  Detecting rollback to an older valid ledger additionally requires a monotonic
+  `ApprovalCheckpoint` outside SQLite's rollback boundary.
+- The reference HMAC verifier shares signing authority with the evaluator and
+  is rejected by production construction. Use `Ed25519ApprovalVerifier` or an
+  equivalent verifier with isolated signing authority.
 - Ed25519 key distribution, storage, rotation timing, and real-world reviewer identity remain the host's responsibility.
+- Approval-ledger integrity-key rotation is not implemented. Sealing a legacy
+  ledger requires an explicit one-time trust decision and cannot establish that
+  the old contents were clean before sealing.
 - Pattern scanning cannot establish semantic safety and is only defense in depth.
 - Armour does not protect information already sent to a cloud model.
 - It authenticates configured approval keys, not the real-world identity behind them; it does not sign policies, manage credentials, or enforce resource quotas yet.

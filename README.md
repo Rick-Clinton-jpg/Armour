@@ -202,6 +202,7 @@ approval_verifier = Ed25519ApprovalVerifier(
 approval_ledger = SQLiteApprovalLedger(
     workspace / "armour-approvals.sqlite3",
     deployment_namespace="notes-production",
+    integrity_key=load_32_byte_key_from_secret_manager(),
 )
 gate = ArmourGate.production(
     policy,
@@ -212,7 +213,9 @@ gate = ArmourGate.production(
 decision = gate.evaluate(proposal, approval=approval)
 ```
 
-`Ed25519ApprovalVerifier` supports key rotation by accepting an explicit map of currently trusted public keys; removing a key ID revokes future approvals from it. The dependency-free `HMACApprovalVerifier` remains available for environments where the evaluator is trusted with the shared signing secret. `SQLiteApprovalLedger` atomically consumes approval nonces across process restarts and multiple Armour processes sharing the same database. Policy and key changes do not reset nonce history. Production construction fails closed unless both trusted approval verification and durable replay storage are configured.
+`Ed25519ApprovalVerifier` supports key rotation by accepting an explicit map of currently trusted public keys; removing a key ID revokes future approvals from it. The dependency-free `HMACApprovalVerifier` remains available for development or environments where the evaluator is intentionally trusted with the shared signing secret. `SQLiteApprovalLedger` atomically consumes approval nonces across process restarts and multiple Armour processes sharing the same database. Policy and key changes do not reset nonce history. Production construction fails closed unless signing authority is isolated from the evaluator and replay storage is both durable and authenticated. A host-provided monotonic `ApprovalCheckpoint` is additionally required to detect replacement by an older, valid ledger.
+
+The integrity key must be at least 32 bytes, remain outside SQLite, and remain stable across restarts. An existing unsealed ledger is rejected by default. After independently validating that legacy database, an operator may open it once with `trust_existing_claims=True` to seal its current contents. This cannot prove the ledger was untampered before sealing. Automatic ledger-integrity-key rotation is not implemented.
 
 Valid approvals are consumed by `evaluate()` by default, including when a caller uses the gate directly. `consume_approval=False` is an explicit preview mode; its result must never be treated as execution authority.
 
@@ -263,10 +266,12 @@ Early-stage research prototype and active work in progress. Policy integrity che
 - Armour is not an operating-system, container, process, or bytecode sandbox.
 - Registered handlers remain trusted code and can violate policy if incorrectly written.
 - Filesystem and DNS checks have time-of-check/time-of-use risks that handlers must address.
-- HMAC approval verification does not isolate signing authority from the evaluator; use the optional Ed25519 signer/verifier when that separation is required.
+- HMAC approval verification does not isolate signing authority from the evaluator and is rejected by production construction; use Ed25519 or an equivalent verifier that keeps signing authority outside the evaluator.
 - Armour validates configured public keys but does not operate a certificate authority, distribute keys, or automatically expire signing keys.
 - Development mode uses process-local replay protection unless `SQLiteApprovalLedger` is supplied; production mode refuses that fallback.
 - SQLite protects concurrent processes sharing one database file, not hosts that do not share an atomic store.
+- Direct replay-ledger edits fail closed when the production integrity key remains secret. Detecting replacement by an older valid ledger additionally requires a monotonic `ApprovalCheckpoint` outside SQLite's rollback boundary.
+- Approval-ledger integrity currently hashes all claims in the deployment namespace on each operation. This is bounded by operational control rather than an implemented claim-retention limit and requires performance testing for large ledgers.
 - Pattern scanning is defense in depth, not semantic proof.
 - Armour cannot protect information already sent to a cloud model.
 - Receipt hash chaining detects modification but cannot prevent deletion of the entire receipt file.
